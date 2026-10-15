@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "elenvind"
-version = "1.0.0"
+version = "1.0.1"
 description = "A security-first personal website and blog server built on the Python standard library, WSGI, SQLite and Jinja2."
 readme = "README.md"
 requires-python = ">=3.11"
