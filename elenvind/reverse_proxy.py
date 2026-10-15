@@ -28,6 +28,11 @@ from .core.console import error, info, warning
 #: 否则应用还在处理连接就被代理切断（表现为随机的 502）。
 DEFAULT_PROXY_READ_TIMEOUT = 40
 
+#: HTTP/2 的两种写法。nginx 1.25.1 起才有独立的 `http2 on;` 指令；
+#: 更早的版本只能在 `listen` 上带 `http2`，写错会让 nginx **直接启动失败**。
+HTTP2_MODERN = "    listen 443 ssl;\n    listen [::]:443 ssl;\n    http2 on;"
+HTTP2_LEGACY = "    listen 443 ssl http2;\n    listen [::]:443 ssl http2;"
+
 #: 受管段落的标记。四种代理的注释符都是 `#`，因此同一套标记通用。
 MARKER_BEGIN = "# >>> elenvind:{domain} >>>"
 MARKER_END = "# <<< elenvind:{domain} <<<"
@@ -57,6 +62,10 @@ class Render:
     body_limit: str = "2m"
     body_limit_bytes: int = 2 * 1024 * 1024
     read_timeout: int = DEFAULT_PROXY_READ_TIMEOUT
+    #: HTTP/2 的写法（`HTTP2_MODERN` / `HTTP2_LEGACY`）。默认给兼容写法：
+    #: `http2 on;` 在 1.25.1 之前的 nginx 上是未知指令，会让代理起不来；
+    #: CLI 会按本机 nginx 版本覆盖成合适的那个。
+    http2: str = HTTP2_LEGACY
 
 
 @dataclass(frozen=True)
@@ -95,6 +104,46 @@ def _has_directory(path: Path) -> bool:
     return path.is_dir()
 
 
+def _nginx_version() -> tuple[int, ...] | None:
+    """本机 nginx 的版本号（`nginx -v` 把版本打在 stderr）；拿不到返回 None。"""
+    binary = shutil.which("nginx")
+    if not binary:
+        return None
+    try:
+        result = subprocess.run([binary, "-v"], capture_output=True, text=True,
+                                check=False)
+    except OSError:
+        return None
+    match = re.search(r"nginx/(\d+)\.(\d+)(?:\.(\d+))?",
+                      (result.stderr or "") + (result.stdout or ""))
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups(default="0"))
+
+
+def nginx_supports_http2_directive() -> bool:
+    """本机 nginx 是否支持独立的 `http2 on;`（1.25.1 起）。"""
+    version = _nginx_version()
+    return bool(version) and version >= (1, 25, 1)
+
+
+def nginx_http2_block() -> tuple[str, str]:
+    """按本机 nginx 版本返回 `(HTTP/2 写法, 说明)`。
+
+    拿不到版本号时用**兼容写法**：`listen ... http2` 在 1.9.5 起的版本上都能用，
+    在新版本上只是被标记为已弃用（日志一条 warning）；而反过来，`http2 on;` 在
+    1.25.1 之前是未知指令，会直接让 nginx 配置校验失败。
+    """
+    version = _nginx_version()
+    shown = ".".join(str(part) for part in version) if version else ""
+    if version and version >= (1, 25, 1):
+        return HTTP2_MODERN, f"nginx {shown} 支持 `http2 on;`，已采用该写法"
+    if version:
+        return HTTP2_LEGACY, (f"nginx {shown} 不认识 `http2 on;`（1.25.1 起才有），"
+                              f"已改用 `listen 443 ssl http2;`")
+    return HTTP2_LEGACY, "无法确定 nginx 版本，使用兼容写法 `listen 443 ssl http2;`"
+
+
 def _render_nginx(spec: Render) -> str:
     return f"""\
 # Elenvind：{spec.domain}
@@ -110,9 +159,7 @@ server {{
 }}
 
 server {{
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+{spec.http2}
     server_name {spec.domain};
 
     ssl_certificate     {spec.certificate.cert};

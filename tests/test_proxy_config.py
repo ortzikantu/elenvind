@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -201,6 +202,50 @@ class CertificateSearch(unittest.TestCase):
         with self.assertRaises(rp.ProxyError):
             rp.find_certificate(DOMAIN, str(directory / "nope.pem"),
                                 str(directory / "privkey.pem"), self.root)
+
+
+class NginxHttp2Spelling(unittest.TestCase):
+    """HTTP/2 写法必须与本机 nginx 匹配：写错会让代理**起不来**，不是样式问题。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="elenvind-h2-")
+        self.root = Path(self._tmp.name)
+        self.cert_dir = self.root / "tls"
+        self.cert_dir.mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_block_matches_the_installed_version(self):
+        if not shutil.which("nginx"):
+            self.skipTest("本机没有 nginx")
+        version = rp._nginx_version()
+        block, note = rp.nginx_http2_block()
+        self.assertTrue(note)
+        if rp.nginx_supports_http2_directive():
+            self.assertEqual(block, rp.HTTP2_MODERN, version)
+            self.assertIn("http2 on;", block)
+        else:
+            self.assertEqual(block, rp.HTTP2_LEGACY, version)
+            self.assertNotIn("http2 on;", block)
+            self.assertIn("ssl http2", block)
+
+    def test_generated_nginx_never_emits_an_unknown_directive(self):
+        """按本机版本渲染出的 server 块，只能出现本机认识的 HTTP/2 写法。"""
+        block, _note = rp.nginx_http2_block()
+        spec = rp.Render(domain=DOMAIN, upstream="127.0.0.1:6789",
+                         certificate=rp.Certificate(self.cert_dir / "fullchain.pem",
+                                                    self.cert_dir / "privkey.pem"),
+                         http2=block)
+        text = rp.find("nginx").render(spec)
+        if rp.nginx_supports_http2_directive() or not shutil.which("nginx"):
+            self.assertIn("http2 on;", text)
+        else:
+            self.assertNotIn("http2 on;", text)
+            self.assertIn("listen 443 ssl http2;", text)
+
+    def test_default_spelling_is_the_compatible_one(self):
+        """默认值必须是兼容写法：忘记覆盖时不该在旧 nginx 上炸。"""
+        self.assertEqual(rp.Render.__dataclass_fields__["http2"].default, rp.HTTP2_LEGACY)
+        self.assertNotIn("http2 on;", rp.HTTP2_LEGACY)
 
 
 class DryRunNeverWrites(unittest.TestCase):

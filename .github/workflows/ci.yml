@@ -41,6 +41,35 @@ jobs:
           pip install -r requirements.txt
           pip install ruff
 
+      - name: 安装 nginx（官方源，验证目标环境的 HTTP/2 写法）
+        run: |
+          set -euo pipefail
+          # runner 自带的是发行版 nginx（Ubuntu 24.04 = 1.24，不认识 `http2 on;`），
+          # 先移除再从官方 mainline 源装，让 CI 与真实生产环境一致。
+          sudo apt-get remove -y --purge nginx nginx-common nginx-core || true
+          sudo systemctl mask nginx 2>/dev/null || true
+          curl -fsSL https://nginx.org/keys/nginx_signing.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/mainline/ubuntu ${UBUNTU_CODENAME:-$VERSION_CODENAME} nginx" \
+            | sudo tee /etc/apt/sources.list.d/nginx.list >/dev/null
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx
+
+      - name: 确认 nginx 版本（必须支持 `http2 on;`）
+        run: |
+          python3 - <<'PY'
+          import subprocess
+
+          result = subprocess.run(["nginx", "-v"], capture_output=True, text=True)
+          version = (result.stderr + result.stdout).split("nginx/")[1].split()[0]
+          parts = tuple(int(part) for part in version.split("."))
+          print("nginx", version)
+          assert parts >= (1, 25, 1), (
+              f"CI 的 nginx 太旧：{version}；本项目的生成配置面向支持 `http2 on;` 的环境，"
+              "请确认上面那一步从 nginx.org 安装成功")
+          PY
+
       - name: 静态检查
         run: ruff check .
 

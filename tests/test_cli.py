@@ -374,7 +374,8 @@ class ProxyConfiguration(unittest.TestCase):
         spec = self.rp.Render(domain="example.test", upstream="127.0.0.1:6789",
                               certificate=certificate)
         markers = {
-            "nginx": ("listen 80;", "listen 443 ssl;"),
+            # 不带分号：`listen 443 ssl;` 与 `listen 443 ssl http2;` 都要能匹配
+            "nginx": ("listen 80;", "listen 443 ssl"),
             "caddy": ("reverse_proxy", "tls "),
             "apache": ("<VirtualHost *:80>", "<VirtualHost *:443>"),
             "haproxy": ("bind :80", "bind :443 ssl"),

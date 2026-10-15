@@ -7,7 +7,7 @@ description = "A Personal Website Server"
 # 站点对外地址：robots.txt / sitemap.xml 里所有绝对 URL 的唯一来源。
 # 绝不从请求的 Host 头推导（Host 由客户端控制，会造成 Host 头投毒）。
 # 留空则这些文件不输出绝对地址；填了必须是不带结尾斜杠的 http(s) 绝对地址。
-site_url = "https://ortzikantu.com"
+site_url = "https://example.com"
 
 # 管理员账号 id：可删除/恢复任意评论（不再硬编码为 1）。
 # 缺失或非法时视为"无管理员"，不会静默把权限给 id=1。

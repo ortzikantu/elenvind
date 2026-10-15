@@ -73,7 +73,10 @@ server {
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
-    http2 on;                              # nginx < 1.25.1 请改用 `listen 443 ssl http2;`
+    # HTTP/2：nginx >= 1.25.1 用 `http2 on;`；更早的版本（如 Ubuntu 24.04 自带的
+    # 1.24）不认识它，改用 `listen 443 ssl http2;` 并删掉这一行。
+    # `elenvind proxy configure` 会按本机版本自动选对写法。
+    http2 on;
     server_name example.com;
 
     ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;

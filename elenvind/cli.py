@@ -432,6 +432,7 @@ def _cmd_proxy_configure(args) -> int:
         error(str(problem))
         return EXIT_FAILED
 
+    http2_block, http2_note = reverse_proxy.nginx_http2_block()
     spec = reverse_proxy.Render(
         domain=domain,
         upstream=_upstream(server_config),
@@ -439,6 +440,7 @@ def _cmd_proxy_configure(args) -> int:
         body_limit=args.body_limit or _body_limit(config),
         body_limit_bytes=_body_limit_bytes(config),
         read_timeout=reverse_proxy.read_source_timeout(server_config),
+        http2=http2_block,
     )
     plan_ = reverse_proxy.plan(proxy, spec)
 
@@ -446,6 +448,8 @@ def _cmd_proxy_configure(args) -> int:
     info(f"反向代理：{proxy.title}（{reason}）")
     info(f"站点：{domain} -> http://{spec.upstream}")
     info(f"证书：{certificate.cert}（来源：{certificate.source}）")
+    if proxy.name == "nginx":
+        info(f"HTTP/2：{http2_note}")
 
     if plan_.blocked:
         error(plan_.message)
