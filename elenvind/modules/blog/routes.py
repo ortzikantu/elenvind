@@ -1,0 +1,263 @@
+"""Blog 模块的 HTTP 路由（只做业务，安全全部交给 Core）。
+
+路由声明即安全：
+    @router.route("/article/<slug>", methods=["GET"])
+    @router.route("/article/<slug>/comment", methods=["POST"], auth="required")
+"""
+from __future__ import annotations
+
+import logging
+
+from ...core.auth import require_owner
+from ...core.config import config
+from ...core.context import current_lang
+from ...core.http import Forbidden, NotFound, html, redirect
+from ...core.i18n import t
+from ...core.security import is_admin
+from ...core.session import current_user
+from ...core.templating import render_template
+from ...database.comment import get_comment_by_id
+from . import logic
+
+logger = logging.getLogger(__name__)
+
+#: 评论失败的 outcome -> i18n key。
+#: 文案集中在 i18n（en/zh/ja），模块不再产出面向用户的英文串
+#: （否则中文站点上会冒出 `Content cannot be empty` 这类提示）。
+_COMMENT_ERROR_KEYS = {
+    "empty": "comment_err_empty",
+    "too_long": "comment_err_too_long",
+    "rate_user": "comment_err_rate_user",
+    "rate_ip": "comment_err_rate_ip",
+    "too_many": "comment_err_too_many",
+    "bad_parent": "comment_err_bad_parent",
+    "too_deep": "comment_err_too_deep",
+    "redacted": "comment_edit_redacted",
+}
+#: 这些 outcome 属于"被限流"，用 429；其余是请求本身有问题，用 400。
+_RATE_LIMITED_OUTCOMES = frozenset({"rate_user", "rate_ip", "too_many"})
+
+
+def _comment_error(request, slug, outcome):
+    """按 outcome 渲染提示。
+
+    **限流类** outcome（单用户 / 单 IP / 单篇配额）不渲染文章页：那会为每一次
+    被拒请求读回整棵评论树并渲染整页（实测 429 响应体积 = 文章页的 102%）。
+    改为轻量错误页，把"达到限制之后"的每次请求成本压到与普通错误页等价。
+    其它 outcome（空内容 / 超长 / 非法回复目标 / 超层）仍保留文章页上的就地提示。
+    """
+    key = _COMMENT_ERROR_KEYS.get(outcome, "comment_err_generic")
+    if outcome in _RATE_LIMITED_OUTCOMES:
+        lang = current_lang()
+        return html(render_template("errors/error.html", {
+            "error_title": t(lang, "comment_err_rate_title"),
+            "error_message": t(lang, key),
+        }), status=429)
+    return _article_error(request, slug, t(current_lang(), key), status=400)
+
+
+def _safe_int(value, default=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def register(router, *, render_not_found):
+    """把一个 Blog 路由集合装到给定 router 上。
+
+    只收 `render_not_found`（文章/页面不存在时渲染带布局的 404）。
+    不收 `render_forbidden`：评论等写操作的 403 由 Core 的
+    `router.dispatch(forbidden=...)` 统一处理。
+    """
+
+    @router.route("/", methods=["GET"])
+    def home(request):
+        page = _safe_int(request.arg("page"), 1)
+        context = logic.article_list_context(page)
+        return html(render_template("home.html", context))
+
+    @router.route("/article/<slug>", methods=["GET"])
+    def article(request, slug):
+        context = logic.article_context(slug)
+        if context is None:
+            return render_not_found(request)
+        context.update(_comment_section(request, slug))
+        return html(render_template("article.html", context))
+
+    @router.route("/article/<slug>/comment", methods=["POST"], auth="required")
+    def create_comment(request, slug):
+        if logic.get_article_by_slug(slug) is None:
+            raise NotFound("Article not found")
+        user = current_user(request)
+        reply_to = None
+        raw_reply = request.form.get("reply_to", "")
+        if raw_reply:
+            reply_to = _safe_int(raw_reply)
+            if reply_to is None:
+                return _article_error(request, slug,
+                                      t(current_lang(), "comment_err_invalid_reply"))
+            parent = get_comment_by_id(reply_to)
+            # 这里只做"能给出更友好提示"的预检 + 需要父行内容的判断。
+            # 权威判定在 core/db_comment_rate.try_post_comment 的事务内
+            # （存在性 + 同文章 + 深度上限），即使有人绕过表单直接 POST 也拦得住。
+            if not parent or parent["article_slug"] != slug:
+                return _article_error(request, slug,
+                                      t(current_lang(), "comment_err_invalid_reply"))
+            # 刻意**不**校验 parent["is_deleted"]：涂黑只销毁正文，评论链保持完整，
+            # 已涂黑的评论仍可被回复。
+            #
+            # 深度上限也刻意只在这里"顺手一提"：预检在事务外，属于 TOCTOU
+            # （并发时两个请求可能都看到"还没到顶"）。真正的判定在事务内，
+            # 这里提前拦只是为了少走一趟事务、并给出同样的文案。
+            if logic.comment_depth(parent) + 1 > logic._max_depth():
+                return _article_error(request, slug,
+                                      t(current_lang(), "comment_err_depth_limit"))
+
+        outcome = logic.post_comment(slug, user["id"], request.client_ip,
+                                     request.form.get("content", ""), reply_to)
+        if outcome != "ok":
+            # 日志措辞保持稳定（运维手册与排障习惯依赖它）
+            if outcome == "rate_user":
+                logger.warning("Comment rate limit hit (user): user_id=%s ip=%s slug=%s",
+                               user["id"], request.client_ip, slug)
+            elif outcome == "rate_ip":
+                logger.warning("Comment rate limit hit (ip): user_id=%s ip=%s slug=%s",
+                               user["id"], request.client_ip, slug)
+            elif outcome == "too_many":
+                logger.warning("Comment count limit hit: slug=%s", slug)
+            elif outcome == "bad_parent":
+                # 走到这里说明事务内的权威校验拒绝了它（存在性/跨文章）
+                logger.warning("Comment rejected (bad parent): user_id=%s ip=%s "
+                               "slug=%s parent_id=%s",
+                               user["id"], request.client_ip, slug, reply_to)
+            elif outcome == "too_deep":
+                # 事务内的深度判定（预检在事务外，这里才是权威）
+                logger.warning("Comment rejected (too deep): user_id=%s ip=%s "
+                               "slug=%s parent_id=%s",
+                               user["id"], request.client_ip, slug, reply_to)
+            return _comment_error(request, slug, outcome)
+        logger.info("Comment created: slug=%s user_id=%s parent_id=%s ip=%s",
+                    slug, user["id"], reply_to, request.client_ip)
+        return redirect(f"/article/{slug}#comments")
+
+    @router.route("/article/<slug>/comment/delete/<comment_id>", methods=["POST"],
+                  auth="required")
+    def delete_comment(request, slug, comment_id):
+        comment = _authorized_comment(request, slug, comment_id, admin_only=False)
+        if not comment["is_deleted"]:
+            logic.remove_comment(comment["id"])
+            # 涂黑**不可逆**：日志只记录动作，绝不记录正文
+            logger.info("Comment redacted: id=%s slug=%s by user_id=%s",
+                        comment["id"], slug, request.user["id"])
+        return redirect(f"/article/{slug}#comments")
+
+    @router.route("/article/<slug>/comment/edit/<comment_id>", methods=["POST"],
+                  auth="required")
+    def edit_comment(request, slug, comment_id):
+        """编辑自己的评论（复用同一个输入框，见 _comment_form）。"""
+        comment = _authorized_comment(request, slug, comment_id, admin_only=False)
+        if not require_owner(current_user(request), comment):
+            # 管理员可以涂黑，但不能改写别人的话（与按钮集合保持一致）
+            raise Forbidden("Forbidden")
+        if comment["is_deleted"]:
+            return _comment_error(request, slug, "redacted")
+        outcome = logic.edit_comment(comment["id"], request.form.get("content", ""))
+        if outcome != "ok":
+            return _comment_error(request, slug, outcome)
+        logger.info("Comment edited: id=%s slug=%s user_id=%s",
+                    comment["id"], slug, request.user["id"])
+        return redirect(f"/article/{slug}#comments")
+
+    return router
+
+
+def _comment_section(request, slug):
+    """评论区上下文（登录用户才需要 CSRF 表单）。"""
+    user = current_user(request)
+    max_length = logic.default_max_length()
+    rows, total, max_len = logic.build_comment_rows(slug, user, max_length=max_length)
+    reply_to = _safe_int(request.arg("reply_to"))
+    reply_to_message = ""
+    if reply_to and user is not None:
+        parent = get_comment_by_id(reply_to)
+        if parent and parent["article_slug"] == slug:
+            deleted = config.get("deleted_user_nickname", "Journeyed On")
+            label = (f"{deleted} (#{parent['user_id']})" if parent["user_deleted"]
+                     else f"{parent['nickname'] or 'Unknown'} (#{parent['user_id']})")
+            reply_to_message = t(current_lang(), "comment_replying", name=label)
+    return {
+        "comment_rows": rows,
+        "comment_total": total,
+        "max_comment_length": max_len,
+        "reply_to_value": str(reply_to or ""),
+        "reply_to_message": reply_to_message,
+        "comment_form": _comment_form(request, slug, user, reply_to),
+    }
+
+
+def _comment_form(request, slug, user, reply_to):
+    """评论输入框上下文：发表与**编辑复用同一个表单**（Zero-JS）。
+
+    编辑按钮是个普通链接 `?edit=<id>#comment-form`：服务端把同一个 textarea
+    预填成待编辑正文、action 指向编辑端点，并给出"取消"链接。因此既不需要
+    前端脚本，也不需要第二个表单（这正是用户要的"复用下面的输入框"）。
+    """
+    lang = current_lang()
+    edit_id = _safe_int(request.arg("edit"))
+    editing = None
+    if edit_id and user is not None:
+        candidate = get_comment_by_id(edit_id)
+        if (candidate and candidate["article_slug"] == slug
+                and not candidate["is_deleted"] and require_owner(user, candidate)):
+            editing = candidate
+    if editing is not None:
+        return {
+            "action": f"/article/{slug}/comment/edit/{editing['id']}",
+            "title": t(lang, "comment_edit_title"),
+            "submit": t(lang, "comment_edit_save"),
+            "content": editing["content"],
+            "reply_to": "",
+            "editing": True,
+            "css": "comment-compose is-editing",
+            "cancel_url": f"/article/{slug}#comments",
+            "cancel_label": t(lang, "comment_edit_cancel"),
+        }
+    return {
+        "action": f"/article/{slug}/comment",
+        "title": t(lang, "comment_post_title"),
+        "submit": t(lang, "comment_submit"),
+        "content": "",
+        "reply_to": str(reply_to or ""),
+        "editing": False,
+        "css": "comment-compose",
+        "cancel_url": f"/article/{slug}#comments" if reply_to else "",
+        "cancel_label": t(lang, "comment_edit_cancel"),
+    }
+
+
+def _article_error(request, slug, message, *, status=400):
+    """评论被拒：渲染文章页 + 明确提示（而不是裸文本）。"""
+    context = logic.article_context(slug) or {}
+    context.update(_comment_section(request, slug))
+    context["message"] = message
+    context["message_kind"] = "error"
+    return html(render_template("article.html", context), status=status)
+
+
+def _authorized_comment(request, slug, raw_id, *, admin_only):
+    """删除/恢复前的归属校验（业务权限；认证已由 Core 完成）。"""
+    comment_id = _safe_int(raw_id)
+    if comment_id is None:
+        raise Forbidden("Invalid comment")
+    comment = get_comment_by_id(comment_id)
+    if not comment:
+        raise NotFound("Comment not found")
+    if comment["article_slug"] != slug:
+        raise Forbidden("Invalid comment")
+    user = current_user(request)
+    if is_admin(user):
+        return comment
+    if admin_only or not require_owner(user, comment):
+        raise Forbidden("Forbidden")
+    return comment

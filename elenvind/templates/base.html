@@ -1,0 +1,26 @@
+{# 全站基础布局：所有页面模板都 extends 本文件。
+   Python 只准备数据，HTML 全部在这里。 #}
+<!DOCTYPE html>
+<html lang="{{ lang }}"{% if theme in ('light', 'dark') %} data-theme="{{ theme }}"{% endif %}>
+  <head>
+    <meta charset="utf-8">
+    <title>{% block title %}{{ site_title }}{% endblock %}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="generator" content="Elenvind {{ elenvind_version }}">
+    {% if description %}<meta name="description" content="{{ description }}">{% endif %}
+    {% if keywords %}<meta name="keywords" content="{{ keywords }}">{% endif %}
+    {# 样式表：地址来自配置（管理员自己托管）。未配置就**不输出**该标签。 #}
+    {% set stylesheet = css_url() %}
+    {% if stylesheet %}<link rel="stylesheet" href="{{ stylesheet }}">{% endif %}
+    {# 图标：同上。未配置时不输出，避免浏览器去请求一个不存在的 /favicon.ico。 #}
+    {% set icon = icon_url() %}
+    {% if icon %}<link rel="icon" href="{{ icon }}">{% endif %}
+  </head>
+  <body>
+    {% include "partials/navbar.html" %}
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+    {% include "partials/footer.html" %}
+  </body>
+</html>

@@ -1,0 +1,30 @@
+# 源码分发包（sdist）里放什么。
+#
+# 站点实例的内容**绝不入包**：config.toml 里有 admin_user_id，articles/ 与
+# custom/ 是作者的真实内容，data/logs/backups 是运行期数据。wheel 只装
+# elenvind 包本身（见 pyproject.toml 的 package-data），sdist 额外带上
+# 测试与手册，让"下载源码就能跑"和"审阅它"都成立。
+
+include README.md LICENSE requirements.txt run.py pyproject.toml
+recursive-include manual *
+recursive-include tests *
+recursive-include elenvind/templates *.html
+recursive-include elenvind/i18n *.toml
+recursive-include elenvind/resources *
+
+# 站点实例与运行期产物
+exclude config.toml
+prune articles
+prune custom
+prune data
+prune logs
+prune backups
+prune .venv
+prune .git
+
+global-exclude __pycache__ *.py[cod] *.db *.db-wal *.db-shm *.write.lock
+global-exclude *.pre-v*.db .DS_Store *.egg-info
+# 构建过程会在源码树里生成 egg-info 目录，它不是源码
+prune elenvind.egg-info
+prune dist
+prune build

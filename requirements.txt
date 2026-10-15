@@ -1,0 +1,8 @@
+# 核心运行时依赖（与 pyproject.toml 的 [project].dependencies 同名同版本范围）。
+# 精确锁定是为了让开发与 CI 可复现；发布到 PyPI 的包用范围而非锁定。
+Jinja2==3.1.6
+Markdown==3.11
+MarkupSafe==3.0.3
+# WSGI 服务器**不是**核心依赖：换服务器只该换一个包。
+# 开发环境用 Gunicorn（CI 与文档的默认），其它服务器按需 `pip install elenvind[waitress]` 等。
+gunicorn==26.2.0

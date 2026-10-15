@@ -1,0 +1,554 @@
+"""安全原语：密码哈希、CSRF 令牌与 Cookie 构造。
+
+本模块只做密码学原语与 Cookie 构造，不碰数据库（会话 token 的持久化在 `database.session`），
+导入时不读文件、不读环境变量（便于测试与审计）。
+
+**不需要任何签名密钥**：会话是服务端随机 token，CSRF 是双提交 Cookie，密码是自描述
+哈希 —— 没有任何东西需要"用一个密钥去签"。
+
+密码哈希格式（自描述，支持长期升级迁移）：
+
+    scrypt$ln=15,r=8,p=1$<salt hex>$<digest hex>          <- 当前写入格式
+    pbkdf2_sha256$600000$<salt hex>$<digest hex>          <- 可写入 / 可校验
+    <salt hex>$<digest hex>                               <- 历史格式（仅校验）
+
+旧格式使用者在下次登录成功后会被透明地重新哈希为新格式（渐进式 rehash，见
+`password_needs_rehash`），不需要强制全员改密。
+"""
+import hashlib
+import hmac
+import os
+import re
+import secrets
+from http.cookies import SimpleCookie
+
+# ----- Cookie 名称与生命周期 -----
+# 名称可在启动时切换为 __Host- 前缀（config.toml [server].cookie_prefix = true）。
+# __Host- 前缀由浏览器强制要求 Secure + Path=/ + 无 Domain，能挡子域名写 Cookie 的攻击；
+# 但它依赖全程 HTTPS，因此默认关闭，仅 HTTPS 部署才应开启。
+# 读取时始终同时接受带前缀与不带前缀两种名字，切换配置不会把所有人踢下线。
+SESSION_COOKIE = "session"
+CSRF_COOKIE = "csrf"
+THEME_COOKIE = "theme"              # 手动白/夜主题偏好（light/dark），无该 Cookie 时跟随系统
+#: 会话 Cookie 的**兜底**寿命。真实值由 core.session.session_cookie_max_age()
+#: 按 config 的 session_absolute_days 计算（默认 30 天）；这里只在
+#: 绝对过期被设为 0（不过期）时兜底，避免下发一个立即过期的 Cookie。
+SESSION_MAX_AGE = 7 * 86400
+CSRF_MAX_AGE = 30 * 86400        # CSRF Cookie 30 天（仅做同源比对，无状态）
+THEME_MAX_AGE = 365 * 86400      # 主题 Cookie 1 年
+
+_COOKIE_PREFIX = ""
+
+
+def configure_cookie_prefix(enabled: bool) -> None:
+    """启用/停用 __Host- 前缀（由 config 校验阶段调用一次）。"""
+    global _COOKIE_PREFIX
+    _COOKIE_PREFIX = "__Host-" if enabled else ""
+
+
+def cookie_name(base: str) -> str:
+    """返回带当前前缀的 Cookie 名（写入时使用）。"""
+    return _COOKIE_PREFIX + base
+
+
+def cookie_names(base: str) -> tuple:
+    """返回该 Cookie 的全部可接受名称（写入名在前，兼容名在后）。"""
+    canonical = _COOKIE_PREFIX + base
+    if _COOKIE_PREFIX and canonical != base:
+        return (canonical, base)
+    return (canonical,)
+
+
+def pick_cookie(cookies: dict, base: str):
+    """从请求 Cookie 中取出该逻辑 Cookie 的值，不存在返回 None。"""
+    for name in cookie_names(base):
+        if name in cookies:
+            return cookies[name]
+    return None
+
+
+# ----- 输入长度策略（注册 / 登录 / 改密 / 资料修改统一引用） -----
+PASSWORD_MIN = 8
+PASSWORD_MAX = 128
+NICKNAME_MAX = 50
+EMAIL_MAX = 254
+
+#: 一眼就能猜到的口令（小写比对）。只挡"最常被扫中的那批"，
+#: 刻意不做强度评分、不引入字典文件 —— 那会把个人站变成密码策略研究项目。
+#: 真正的防线是 scrypt 成本 + 登录失败限流，这里只是把"弱口令注册"这个
+#: 低门槛入口关掉（例如 `12345678`、`password`）。
+WEAK_PASSWORDS = frozenset({
+    "123456", "1234567", "12345678", "123456789", "1234567890", "123123",
+    "111111", "11111111", "000000", "88888888", "666666", "5201314",
+    "password", "password1", "passw0rd", "p@ssw0rd", "qwerty", "qwerty123",
+    "abc123", "a123456", "aa123456", "admin", "admin123", "administrator",
+    "root", "toor", "letmein", "welcome", "monkey", "dragon", "sunshine",
+    "princess", "football", "baseball", "master", "shadow", "superman",
+    "trustno1", "changeme", "iloveyou", "woaini", "woaini1314", "elenvind",
+})
+
+
+def is_weak_password(password, *, email=None, nickname=None) -> bool:
+    """口令是否"明显不该被接受"。注册与改密共用**同一套**判定。
+
+    刻意保持最小、可预测，只做四条确定性检查（长度策略由调用方的
+    PASSWORD_MIN / MAX 负责）：
+
+    1. 命中常见弱口令表；
+    2. 单一字符重复（`aaaaaaaa`、`11111111`）；
+    3. 纯数字（`12345678`）；
+    4. 与邮箱用户名部分或昵称完全相同（忽略大小写与首尾空白）。
+
+    不查在线泄露库、不强制字符种类混合、不做长度加码：对"个人博客的评论账号"来说
+    收益有限、负担明显。
+    """
+    text = str(password or "")
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered in WEAK_PASSWORDS:
+        return True
+    if len(set(text)) == 1:
+        return True
+    if text.isdigit():
+        return True
+    if email:
+        local = str(email).split("@")[0].strip().lower()
+        if local and lowered == local:
+            return True
+    return bool(nickname) and lowered == str(nickname).strip().lower()
+
+# ----- 密码哈希参数（本机 benchmark 结果：scrypt N=2^15, r=8, p=1 ≈ 240 ms/次） -----
+SCRYPT_N = 2 ** 15           # CPU/内存代价主参数
+SCRYPT_R = 8                 # 块大小
+SCRYPT_P = 1                 # 并行度
+SCRYPT_DKLEN = 32            # 派生密钥长度
+SCRYPT_MAXMEM = 64 * 1024 * 1024   # 允许的最大内存（N=2^15,r=8 实际约 33 MB）
+PBKDF2_ITERATIONS = 600_000  # 本机 ≈ 134 ms/次（历史格式为 10 万次）
+SALT_BYTES = 16
+
+_SCRYPT_ALGO = "scrypt"
+_PBKDF2_ALGO = "pbkdf2_sha256"
+_LEGACY_PBKDF2_ITERATIONS = 100_000   # 历史格式固定参数，仅用于校验旧哈希
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+
+
+def _scrypt(password: bytes, salt: bytes, n: int, r: int, p: int) -> bytes:
+    """scrypt 派生；maxmem 随参数放大，避免 OpenSSL 默认 32 MB 上限误伤。"""
+    maxmem = 132 * n * r + 1024 * 1024
+    return hashlib.scrypt(password, salt=salt, n=n, r=r, p=p,
+                          maxmem=maxmem, dklen=SCRYPT_DKLEN)
+
+
+def _encode_scrypt_params(n: int, r: int, p: int) -> str:
+    return f"ln={n.bit_length() - 1},r={r},p={p}"
+
+
+def _parse_scrypt_params(raw: str):
+    """解析 "ln=15,r=8,p=1"；非法参数返回 None（视为无法识别的哈希）。"""
+    values = {}
+    for part in raw.split(","):
+        key, _, value = part.partition("=")
+        if not value or not value.isdigit():
+            return None
+        values[key.strip()] = int(value)
+    if set(values) != {"ln", "r", "p"}:
+        return None
+    try:
+        n = 1 << values["ln"]
+    except (ValueError, OverflowError):
+        return None
+    r, p = values["r"], values["p"]
+    # 参数边界贴住本项目实际使用的 SCRYPT_N / SCRYPT_R / SCRYPT_P：放宽就等于让
+    # 一条伪造的哈希串申请 132*n*r 级别的内存（ln=20、r=32 时约 4.4 GB），
+    # 一个请求就能把 worker OOM 掉。
+    max_ln = SCRYPT_N.bit_length() - 1
+    if not (1 <= values["ln"] <= max_ln) or not (1 <= r <= SCRYPT_R) \
+            or not (1 <= p <= SCRYPT_P):
+        return None
+    return n, r, p
+
+
+def _parse_hash(stored_hash):
+    """把存储的哈希串解析为 (算法, 参数, 盐, 摘要)。
+
+    无法识别的格式返回 None；调用方据此判定"校验失败"，而不是抛异常。
+    - 4 段：algorithm$params$salt$digest
+    - 2 段：历史格式 salt$digest（等价 pbkdf2_sha256 + 10 万次）
+    """
+    if not isinstance(stored_hash, str) or not stored_hash:
+        return None
+    parts = stored_hash.split("$")
+    try:
+        if len(parts) == 4:
+            algo, params, salt_hex, digest_hex = parts
+        elif len(parts) == 2:
+            algo, params = _PBKDF2_ALGO, str(_LEGACY_PBKDF2_ITERATIONS)
+            salt_hex, digest_hex = parts
+        else:
+            return None
+        if not _HEX_RE.match(salt_hex) or not _HEX_RE.match(digest_hex):
+            return None
+        salt = bytes.fromhex(salt_hex)
+        digest = bytes.fromhex(digest_hex)
+    except (ValueError, TypeError):
+        return None
+    if not salt or not digest:
+        return None
+    return algo, params, salt, digest
+
+
+def hash_password(password: str) -> str:
+    """生成自描述密码哈希串：scrypt$ln=..,r=..,p=..$盐$摘要。"""
+    salt = os.urandom(SALT_BYTES)
+    digest = _scrypt(password.encode("utf-8"), salt, SCRYPT_N, SCRYPT_R, SCRYPT_P)
+    return f"{_SCRYPT_ALGO}${_encode_scrypt_params(SCRYPT_N, SCRYPT_R, SCRYPT_P)}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash) -> bool:
+    """校验密码。只吞掉"格式/参数不可识别"这类预期错误，程序缺陷照常抛出。"""
+    parsed = _parse_hash(stored_hash)
+    if parsed is None:
+        return False
+    algo, params, salt, expected = parsed
+    try:
+        raw = password.encode("utf-8")
+        if algo == _SCRYPT_ALGO:
+            scrypt_params = _parse_scrypt_params(params)
+            if scrypt_params is None:
+                return False
+            candidate = _scrypt(raw, salt, *scrypt_params)
+        elif algo == _PBKDF2_ALGO:
+            if not params.isdigit():
+                return False
+            candidate = hashlib.pbkdf2_hmac("sha256", raw, salt, int(params))
+        else:
+            return False   # 未知算法（未来版本写入的哈希）：不通过，交由升级路径处理
+    except (ValueError, TypeError):
+        # 参数非法（如 ln 超界导致 scrypt 抛 ValueError）；不是程序缺陷
+        return False
+    return hmac.compare_digest(candidate, expected)
+
+
+def password_needs_rehash(stored_hash) -> bool:
+    """判断存储的哈希是否应升级为新格式（未知格式/旧参数一律视为需要）。"""
+    parsed = _parse_hash(stored_hash)
+    if parsed is None:
+        return True
+    algo, params, _salt, _digest = parsed
+    if algo != _SCRYPT_ALGO:
+        return True
+    return _parse_scrypt_params(params) != (SCRYPT_N, SCRYPT_R, SCRYPT_P)
+
+
+#: 哑哈希：账号不存在时用来"陪跑"一次等量校验，弱化计时侧信道。
+#: 对应一个不会被使用的随机口令，仅用于消耗等量 CPU。
+_DUMMY_HASH = None
+
+
+def dummy_verify(password: str) -> bool:
+    """对哑哈希执行一次真实校验（结果恒为 False，仅用于等量计时）。"""
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = hash_password("elenvind-dummy-password-for-timing")
+    return verify_password(password, _DUMMY_HASH)
+
+
+# ----- CSRF 令牌原语 -----
+# 完整的 CSRF 实现（格式校验、常量时间比对、请求校验、模板输入）只在 `core/csrf.py`。
+# 这里保留两个原语：生成（给 csrf.py 用）与格式校验（给 http.py 判断 Cookie 里的
+# 令牌还能不能用，不能用就重新生成，避免把畸形值原样回写）。
+def generate_csrf_token() -> str:
+    """生成 32 字节 URL-safe 随机令牌（固定 43 字符，便于格式校验）。"""
+    return secrets.token_urlsafe(32)
+
+
+def is_valid_csrf_token(token) -> bool:
+    """校验令牌格式，防止把任意超长/异常字符串带入比较逻辑。
+
+    用 fullmatch 而非 match：`$` 在 match 语义下允许结尾多一个换行，
+    会让 "43 个合法字符 + \\n" 通过校验（表单值里带换行并非不可能）。
+
+    实现委托 `core.csrf.is_valid_token` —— 比对逻辑只有那一处。
+    """
+    from .csrf import is_valid_token
+
+    return is_valid_token(token)
+
+
+# ----- 管理员判定 -----
+# 管理员身份只有一个来源：config.toml 顶层 admin_user_id（默认 1，即最早注册的账号）。
+# 业务代码一律调用 is_admin()，不得再散落 "id == 1" 这类魔法数字。
+# admin_user_id 缺失或非法时视为"无管理员"，而不是静默回退到 id=1——
+# 静默回退会把权限悄悄授予一个意料之外的账号。
+def admin_id():
+    """返回当前配置的管理员用户 id；未配置/非法时返回 None。"""
+    from .config import config  # 延迟导入：本模块导入期不依赖 config 加载状态
+    value = config.get("admin_user_id")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def is_admin(user) -> bool:
+    """判断用户是否为管理员（user 可为 sqlite3.Row、dict 或 None）。"""
+    if not user:
+        return False
+    owner = admin_id()
+    if owner is None:
+        return False
+    try:
+        return int(user["id"]) == owner
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def is_admin_id(user_id) -> bool:
+    """按 user_id 判断管理员身份（评论行只带 user_id 时使用）。"""
+    owner = admin_id()
+    if owner is None:
+        return False
+    try:
+        return int(user_id) == owner
+    except (TypeError, ValueError):
+        return False
+
+
+# ----- Cookie 构造 -----
+def _make_cookie(name: str, value: str, secure: bool, max_age: int, http_only: bool = True) -> tuple:
+    """构造 Set-Cookie 响应头（bytes 键值对，交给 `build_headers` 统一组装）。"""
+    cookie = SimpleCookie()
+    cookie[name] = value
+    cookie[name]["path"] = "/"
+    if http_only:
+        cookie[name]["httponly"] = True
+    cookie[name]["samesite"] = "Lax"
+    cookie[name]["max-age"] = max_age
+    if secure:
+        cookie[name]["secure"] = True
+    return (b"set-cookie", cookie[name].OutputString().encode("utf-8"))
+
+
+def set_cookie_header(token: str, secure: bool = False, max_age: int = SESSION_MAX_AGE,
+                      base: str = SESSION_COOKIE) -> tuple:
+    """下发会话 Cookie（登录成功时使用）。"""
+    return _make_cookie(cookie_name(base), token, secure, max_age)
+
+
+def clear_cookie_headers(secure: bool = False, base: str = SESSION_COOKIE,
+                         http_only: bool = True) -> list:
+    """返回让该 Cookie 立即过期的全部 Set-Cookie 头。
+
+    启用 __Host- 前缀后会同时清理旧的无前缀 Cookie，避免切换配置时残留旧值。
+
+    这是**唯一**的"清除 Cookie"入口：`Request.invalidate_session_cookie()` 与
+    `pending_cookies()` 都走它。模块不拼 Set-Cookie，也没有"只清一个名字"的
+    简化版 —— 两份清 Cookie 的实现迟早漂移。
+    """
+    return [_make_cookie(name, "", secure, 0, http_only=http_only) for name in cookie_names(base)]
+
+
+# ----- 安全响应头（全项目唯一定义处） -----
+#
+# 这些头由 Core 在响应收尾阶段统一注入，模块层**完全不需要感知**
+# （模块只要返回 Response，头一定带上）。注入点见 core/http.py:build_headers()。
+
+#: CSP 默认指令表（`[security.csp]` 未配置时使用）。
+#:
+#: - `default-src 'self'` 兜底：同源放行，其余默认拒绝。
+#: - `script-src 'none'`：本站 Zero-JS，直接掐断脚本执行链 —— 比放开 `'self'`
+#:   更安全，且不牺牲任何功能。
+#: - `style-src 'self'`：站点**不含任何内联样式**，因此不需要 `'unsafe-inline'`。
+#:   样式表由管理员自己托管：不在本站同源时必须在 `[security.csp].style-src`
+#:   里显式放行（守卫只允许收窄，拒绝裸 `http:` / `https:` / `*`）。
+#: - `img-src` / `media-src` 放开 http/https：正文与配置里的图片、视频可以是任意
+#:   外部地址；想收紧就改成 `["'self'", "data:"]`。
+DEFAULT_CSP_DIRECTIVES = {
+    "default-src": ("'self'",),
+    "script-src": ("'none'",),
+    "style-src": ("'self'",),
+    # 默认放行外链图片/视频：这是**产品取舍** —— 图片与视频一律由管理员自己
+    # 托管（CDN / 图床 / 自建服务器），本服务不发出静态文件、也不承担带宽。
+    # 代价是访问者会向第三方发起请求（对方可见其 IP/UA）。
+    # 想收紧：在 config.toml 的 [security.csp] 里显式写主机 allowlist，
+    #   例：img-src = ["'self'", "data:", "https://cdn.example.com"]
+    #   （文档一致性守卫拒绝裸 "http:" / "https:" / "*"，允许显式主机列表）
+    "img-src": ("'self'", "data:", "http:", "https:"),
+    "media-src": ("'self'", "http:", "https:"),
+    "font-src": ("'self'",),
+    "connect-src": ("'self'",),
+    "object-src": ("'none'",),
+    "base-uri": ("'none'",),
+    "form-action": ("'self'",),
+    "frame-ancestors": ("'none'",),
+}
+
+#: 默认 Permissions-Policy：把个人博客用不到的能力全部关掉。
+DEFAULT_PERMISSIONS_POLICY = (
+    "accelerometer=(), autoplay=(), camera=(), display-capture=(), "
+    "encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), "
+    "magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), "
+    "publickey-credentials-get=(), screen-wake-lock=(), usb=(), xr-spatial-tracking=(), "
+    "interest-cohort=()"
+)
+
+#: 每个响应都会带上的**静态**安全头。
+#: CSP / Permissions-Policy / HSTS 因可配置，由 build_security_headers() 生成。
+BASE_SECURITY_HEADERS = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"strict-origin-when-cross-origin"),
+    (b"cross-origin-opener-policy", b"same-origin"),
+    (b"cross-origin-resource-policy", b"same-origin"),
+)
+
+def csp_directives():
+    """当前生效的 CSP 指令表（配置覆盖默认；配置为 false/空表示关闭该指令）。"""
+    from .config import config
+
+    overrides = (config.get("security", {}) or {}).get("csp", {}) or {}
+    directives = {}
+    for name, default_values in DEFAULT_CSP_DIRECTIVES.items():
+        if name not in overrides:
+            directives[name] = default_values
+            continue
+        override = overrides[name]
+        if override is None or override is False:
+            continue                        # 显式关闭该指令
+        if isinstance(override, str):
+            override = override.split()
+        cleaned = tuple(str(value) for value in override if str(value).strip())
+        if cleaned:
+            directives[name] = cleaned
+        # 空列表同样视为关闭该指令
+    return directives
+
+
+def csp_header_value() -> str:
+    """序列化后的 CSP 头值；站长关闭 CSP 时返回空串（此时不下发该头）。"""
+    from .config import config
+
+    if (config.get("security", {}) or {}).get("csp_enabled", True) is False:
+        return ""
+    return "; ".join(f"{name} {' '.join(values)}"
+                     for name, values in csp_directives().items())
+
+
+def permissions_policy_value() -> str:
+    """Permissions-Policy 头值；配置为空串表示不下发该头。"""
+    from .config import config
+
+    value = (config.get("security", {}) or {}).get("permissions_policy")
+    if value is None:
+        return DEFAULT_PERMISSIONS_POLICY
+    return str(value).strip()
+
+
+def hsts_header_value() -> str:
+    """HSTS 头值；未启用时返回空串。
+
+    启用判据（两个条件都要满足）：
+    1. `[security] hsts_enabled = true`；
+    2. 请求是 HTTPS —— 在 HTTP 上下发 HSTS 无意义（浏览器直接忽略），
+       而如果站点仍提供 HTTP 访问，误发会把访客锁死在 HTTPS。
+    未显式配置时应跟随 `__Host-` Cookie 前缀：那个前缀本来就要求全程 HTTPS，
+    因此开启它意味着站长已经把站点约束在 HTTPS 上。
+    """
+    from .config import config
+
+    configured = config.get("security", {}) or {}
+    enabled = configured.get("hsts_enabled")
+    if enabled is None:
+        enabled = bool(_COOKIE_PREFIX)
+    if not enabled:
+        return ""
+    try:
+        max_age = int(configured.get("hsts_max_age", 31536000))
+    except (TypeError, ValueError):
+        max_age = 31536000
+    max_age = max(max_age, 0)
+    parts = [f"max-age={max_age}"]
+    if configured.get("hsts_include_subdomains"):
+        parts.append("includeSubDomains")
+    return "; ".join(parts)
+
+
+def build_security_headers(secure: bool = False):
+    """组装**本次响应**要下发的全部安全头（Core 的唯一注入点）。
+
+    模块不需要调用它，也不应该自己加头——`core/http.py` 在每个响应收尾时
+    统一调用（含错误响应与请求解析阶段的早期错误）。
+    """
+    headers = list(BASE_SECURITY_HEADERS)
+    csp = csp_header_value()
+    if csp:
+        headers.append((b"content-security-policy", csp.encode("utf-8")))
+    policy = permissions_policy_value()
+    if policy:
+        headers.append((b"permissions-policy", policy.encode("utf-8")))
+    if secure:
+        hsts = hsts_header_value()
+        if hsts:
+            headers.append((b"strict-transport-security", hsts.encode("ascii")))
+    return headers
+
+
+def stylesheet_is_same_origin() -> bool:
+    """当前生效的样式表 URL 是否同源（决定 `style-src 'self'` 会不会拦掉它）。
+
+    样式表是页面渲染的必需品：如果站长把 `[static].css` 指到 CDN，
+    就必须同时把该来源加进 `style-src`，否则页面会裸奔。
+    这个函数给测试与自检用，避免"配置改了但 CSP 没跟上"。
+
+    未配置样式表（`[static].css` 为空）时返回 True：没有东西需要放行。
+    """
+    from .templating import stylesheet_url
+
+    url = (stylesheet_url() or "").strip()
+    if not url:
+        return True
+    # 绝对 URL（含协议）或协议相对（//host/…）都算跨源
+    if url.startswith("//") or "://" in url:
+        return False
+    return url.startswith("/")
+
+
+def csrf_cookie_header(token: str, secure: bool = False, max_age: int = CSRF_MAX_AGE,
+                       base: str = CSRF_COOKIE) -> tuple:
+    """下发或续期 CSRF Cookie。"""
+    return _make_cookie(cookie_name(base), token, secure, max_age)
+
+
+#: 站内偏好登记表：**唯一**定义"有哪些偏好 Cookie、有效期多久、允许什么值"。
+#:
+#: 模块通过 `request.set_preference(name, value)` 写入、`request.preference(name)`
+#: 读取，两者都按这里的允许值集合校验。这样模块既不需要知道 Cookie 名字，
+#: 也不可能把任意值写进 Cookie —— Cookie 是客户端可控输入，
+#: 必须经白名单才允许回显到页面属性里（例如 `data-theme`）。
+PREFERENCE_COOKIES = {
+    "theme": (THEME_COOKIE, THEME_MAX_AGE, frozenset({"light", "dark"})),
+}
+
+
+def parse_cookie_header(raw: str) -> dict:
+    """把一个 `Cookie:` 请求头的值解析为 {name: value}（同名取最后一个）。
+
+    自己按 RFC 6265 的语法切分而不是交给 `http.cookies.SimpleCookie`：
+    后者遇到一个畸形片段（如 `=broken`）会把**整个头部**的 Cookie 全部丢弃，
+    导致一个损坏的无关 Cookie 让所有人掉线。这里只跳过畸形的那个片段。
+
+    这是 Cookie 解析的**唯一实现**（Core 内部与测试都走这里）。输入是
+    `Cookie:` 请求头的**值**（WSGI 下由 `http.collect_headers()` 从 `HTTP_COOKIE`
+    取到）：只接受值、不接受请求对象，解析逻辑才不会长出第二份。
+    """
+    cookies = {}
+    for part in (raw or "").split(";"):
+        name, sep, value = part.partition("=")
+        if not sep:
+            continue
+        name = name.strip()
+        if not name or value.strip().startswith('"') or "=" in name:
+            # 空名 / 带引号的值（浏览器不会这样发）/ 名字里再出现 "=" 都跳过
+            continue
+        cookies[name.strip()] = value.strip()
+    return cookies

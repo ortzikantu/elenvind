@@ -1,0 +1,79 @@
+# Elenvind systemd 单元
+#
+#   sudo elenvind proxy configure --domain <域名> --apply --with-unit   # 自动装好这个文件
+#   # 或者手工：
+#   sudo cp /path/to/elenvind/resources/elenvind.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now elenvind
+#   journalctl -u elenvind -f
+#
+# 目录布局（代码只读、数据可写）：
+#
+#   /srv/elenvind             代码 / 配置 / 模板 / .venv（服务账号**只读**）
+#   /srv/elenvind/data        sqlite.db（config.toml 的 database 指向这里）
+#   /srv/elenvind/logs        日志
+#   /srv/elenvind/backups     `elenvind backup` 的默认输出目录
+#
+# 一次性准备（属主 root、组 elenvind：服务能读代码但改不了它）：
+#
+#   sudo useradd --system --home /srv/elenvind --shell /usr/sbin/nologin elenvind
+#   sudo chown -R root:elenvind /srv/elenvind
+#   sudo chmod 750 /srv/elenvind && sudo chmod 640 /srv/elenvind/config.toml
+#   sudo install -d -o elenvind -g elenvind -m 750 /srv/elenvind/data \
+#                                                   /srv/elenvind/logs \
+#                                                   /srv/elenvind/backups
+#
+# 本文件里**不能**出现行尾注释：systemd 只把行首 `#` 当注释，行尾 `#` 会把后面的
+# 文字并进参数值，于是那条指令被静默忽略（tests/test_operations.py 有守卫盯这个）。
+
+[Unit]
+Description=Elenvind personal website (WSGI)
+Documentation=file:/srv/elenvind/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=elenvind
+Group=elenvind
+WorkingDirectory=/srv/elenvind
+
+Environment=PYTHONUNBUFFERED=1
+# 代码目录只读：显式关掉 .pyc 写入（只读目录下 Python 本来也会静默跳过）
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# `serve` 会先整体校验配置（不合法就直接退出，不会起一个"看起来在跑"的进程），
+# 再按 config.toml 的 [server].wsgi_server 选择服务器；没写就用可用项里优先级
+# 最高的那个。`--yes` 是必须的：systemd 里没人回答交互式提问。
+# worker 数交给 [server].workers（0 = 按物理核心自适应），不在这里写死 ——
+# 换机器时不必改单元文件。
+ExecStart=/srv/elenvind/.venv/bin/elenvind serve --yes
+
+# Gunicorn 与 uWSGI 支持 HUP 热重载（不中断连接）；其它服务器请用
+# `systemctl restart elenvind`。
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# ---- 加固 ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# CPython 需要可写可执行内存（正常行为），保持默认值
+MemoryDenyWriteExecute=false
+# 只授予真正需要写的三个子目录；`-` 前缀 = 目录暂不存在时忽略而不拒绝启动
+ReadWritePaths=-/srv/elenvind/data -/srv/elenvind/logs -/srv/elenvind/backups
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

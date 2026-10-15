@@ -1,0 +1,137 @@
+"""Core Auth：认证与授权。
+
+认证（你是谁）：`verify_credentials(email, password)` —— 密码哈希、校验与渐进式
+rehash 全部复用 `security.py`，不在这里重写；成功后由 `session` 颁发会话。
+
+授权（你能做什么）只有四档，不建权限框架：
+
+    public         任何人（含匿名）
+    authenticated  已登录
+    admin          config.toml 的 admin_user_id
+    owner          "资源属于你"，由业务显式调用 require_owner()
+
+路由以声明的方式使用：
+
+    @route("/settings", methods=["GET", "POST"], auth="required")
+    @route("/admin", methods=["GET"], permission="admin")
+
+`auth=` 与 `permission=` 最终走**同一套**判定（`check_permission`）：
+`auth="required"` 只是 `auth="authenticated"` 的别名，区别仅在语义命名 ——
+`auth` 回答"要不要登录"，`permission` 回答"要哪个档位"。未知取值在**路由注册时**
+直接报错，不留到运行期失效开放。
+"""
+from __future__ import annotations
+
+from .security import (
+    hash_password,
+    is_admin,
+    password_needs_rehash,
+    verify_password,
+)
+
+#: 权限档位（字符串常量，避免魔法值散落）
+PUBLIC = "public"
+AUTHENTICATED = "authenticated"
+ADMIN = "admin"
+
+#: `auth=` 的别名：路由里写 `auth="required"` 表达"必须已登录"。
+#: 保留它是为了可读性（"这个路由需要认证"比 `auth="authenticated"` 更直白），
+#: 但它必须与 AUTHENTICATED 等价，否则又会变成"声明了却没人认识"。
+REQUIRED = "required"
+
+#: 已知档位。**不在这个集合里的值一律拒绝**（失效关闭）：
+#: 把 `permission="amin"` 这类拼写错误当成"无限制"是最危险的失效方式。
+KNOWN_PERMISSIONS = frozenset({PUBLIC, AUTHENTICATED, ADMIN})
+
+#: `auth=` 允许的取值（`None`/`""` 表示未声明 = public）。
+#: **不含 owner**：资源归属不是路由级声明，必须由业务显式调用 require_owner()，
+#: 因为 Core 无从知道"哪个资源"属于谁。
+KNOWN_AUTH = frozenset({PUBLIC, AUTHENTICATED, ADMIN, REQUIRED})
+
+#: `auth=` 里这些值表示"要求已登录或更强"
+AUTH_REQUIRED_VALUES = frozenset({AUTHENTICATED, REQUIRED, ADMIN})
+
+#: 这些值表示"不限制"（None / 空串来自未声明的路由）
+NO_REQUIREMENT = (None, "")
+
+
+def normalize_auth(value):
+    """把 `auth=` 的取值规范化成权限档位；未声明返回 None。
+
+    `"required"` 是 `"authenticated"` 的别名，两者必须走**同一条**判定路径：
+    多一条分支就多一种"声明了但闸门不认识"的失效开放。
+    """
+    if value in NO_REQUIREMENT:
+        return None
+    return AUTHENTICATED if value == REQUIRED else value
+
+#: 认证结果原因（供模块映射成提示文案，不直接暴露给用户）
+OK = "ok"
+BAD_CREDENTIALS = "bad_credentials"
+NEEDS_REHASH = "needs_rehash"
+
+
+def verify_credentials(user, password: str):
+    """校验一个**已经取出**的用户行的密码。纯函数：不查库、不写库。
+
+    返回 `(ok, rehashed_hash)`：
+
+    - 账号不存在 → `(False, None)`：调用方必须自己跑一次等量哈希校验
+      （`security.dummy_verify`）抹平计时差异，并给出一致提示；
+    - 密码错误 → `(False, None)`；
+    - 成功且哈希参数需要升级 → `(True, 新哈希)`，**落库由调用方决定**（core 不认识
+      database；rehash 只是优化，失败不影响本次登录）。
+
+    这样拆分之后，"谁写数据库"只发生在装配层与 modules，core 里没有任何持久化调用。
+    """
+    if user is None:
+        return False, None
+    stored = user["password"]
+    if not verify_password(password, stored):
+        return False, None
+    if not password_needs_rehash(stored):
+        return True, None
+    try:
+        return True, hash_password(password)
+    except Exception:
+        return True, None
+
+
+def check_permission(request, requirement: str) -> bool:
+    """按声明式权限档位判断是否放行。
+
+    失效关闭：未知档位（拼写错误、未来新增但未实现的值）一律 **拒绝**，
+    绝不"不认识就放行"。
+    """
+    if requirement in NO_REQUIREMENT or requirement == PUBLIC:
+        return True
+    if requirement not in KNOWN_PERMISSIONS:
+        return False
+    # 用户对象是 sqlite3.Row（不支持 getattr），用下标访问
+    try:
+        user = request.user
+    except AttributeError:
+        user = None
+    if requirement == AUTHENTICATED:
+        return user is not None
+    if requirement == ADMIN:
+        return is_admin(user)
+    return False
+
+
+def require_owner(user, resource) -> bool:
+    """资源归属判断：业务显式调用（例如"只有文章/评论作者可操作"）。
+
+    Core 只提供判定能力，不替业务定义"谁是 owner"。
+    """
+    if user is None or resource is None:
+        return False
+    try:
+        return int(resource["user_id"]) == int(user["id"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def is_admin_user(user) -> bool:
+    """给模板/视图用的管理员判定（委托 security.is_admin）。"""
+    return is_admin(user)

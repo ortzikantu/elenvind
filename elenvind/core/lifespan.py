@@ -1,0 +1,114 @@
+"""Core startup/shutdown：启动初始化与关闭清理。
+
+启动顺序固定，任一步失败就抛异常让服务拒绝启动，不会留下"半初始化"的应用：
+
+    config -> validate -> runtime config -> logging -> i18n -> templates
+    -> database(+migration) -> cleanup -> content caches
+
+日志目录与数据库目录在这一阶段创建，路径统一相对实例根解析。关闭时刷新并关闭全部
+日志 handler，避免日志丢失与句柄泄漏。
+
+WSGI 只给了"导入模块"与"调用 callable"两个时机，因此由入口模块显式调用：
+`elenvind/wsgi.py` 在导入时 `startup(STARTUP_HOOKS)`，并用 `atexit` 注册 `shutdown()`。
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+
+from .config import apply_runtime_config, config, load_config, validate_config
+from .console import success, warning
+from .logging_config import resolve_log_path, setup_logging, shutdown_logging
+
+logger = logging.getLogger(__name__)
+
+#: 测试夹具开关：True 时跳过读取 config.toml，沿用调用方注入的 config 字典。
+#: 生产路径永远为 False（不提供环境变量或配置开关）。
+SKIP_CONFIG_LOAD = {"value": False}
+
+
+def shutdown():
+    """进程退出前清理：关闭全部日志 handler（flush 落盘 + 释放句柄）。
+
+    由入口模块（`elenvind/wsgi.py` 的 atexit / gunicorn worker 退出）调用。
+    幂等：`shutdown_logging()` 只是摘掉并关闭自己装的 handler。
+    """
+    warning("Application shutting down")
+    shutdown_logging()
+
+
+def startup(hooks=(), prepare_database=None):
+    """按固定顺序完成全部启动步骤；异常向上抛，由调用方决定如何终止进程。
+
+    参数 `prepare_database`：数据库启动步骤（解析路径 → 配置 database → 建表/迁移 →
+    清理过期数据 → 记录库信息）。由装配层提供 —— core 不认识 database，
+    因此"怎么初始化数据库"不是它的职责。
+
+    参数 `hooks`：`[(说明, callable)]`，在数据库与模板就绪后**按序**执行
+    （业务模块的内容缓存预热）。由装配层显式传入：钩子抛异常会使启动失败 ——
+    这是刻意的：宁可拒绝启动，也不要跑一个"文章列表永远空的"站点。
+
+    幂等，可重复调用（配置重读、日志重装、建表迁移、缓存预热都幂等），因此"每个
+    worker 各跑一次"是安全的。每一步都留 INFO 痕迹，末尾记一条"启动完成 + 耗时 +
+    pid"，多 worker 时用来回答"哪个进程在什么时候起来的"。
+    """
+    started_at = time.monotonic()
+    hooks = tuple(hooks)        # 可能被 len() 与 for 各用一次，先固化
+
+    if not SKIP_CONFIG_LOAD["value"]:
+        load_config()
+        success("Configuration loaded")
+    else:
+        success("Configuration provided by caller (config file load skipped)")
+
+    validate_config()
+    apply_runtime_config()
+    success("Configuration validated")
+
+    logging_cfg = config.get("logging", {})
+    setup_logging(
+        level=logging_cfg.get("level", "info"),
+        log_file=logging_cfg.get("file", "logs/app.log"),
+        max_bytes=logging_cfg.get("max_bytes", 10 * 1024 * 1024),
+        backup_count=logging_cfg.get("backup_count", 5),
+        rotate=logging_cfg.get("rotate", False),
+    )
+    success("Logging configured")
+    logger.info("Log file: %s (level=%s, rotation=%s)", resolve_log_path(
+        logging_cfg.get("file", "logs/app.log")), str(logging_cfg.get("level", "info")).lower(),
+        "in-app" if logging_cfg.get("rotate", False) else "external (logrotate)")
+
+    from . import i18n
+    i18n.load()
+    success("i18n messages loaded")
+
+    # 模板目录/语法问题在此阶段暴露（不等到第一个页面请求）。
+    # **必须真的逐个编译**：只构造 Environment 不会解析任何模板文件，
+    # 一个写错的 `{% if %}` 就会变成"启动成功，但每个页面 500"。
+    from .templating import get_environment
+    environment = get_environment()
+    names = environment.list_templates()
+    broken = []
+    for name in names:
+        try:
+            environment.get_template(name)
+        except Exception as exc:            # 启动期：把模板错误变成明确的启动失败
+            broken.append(f"{name}: {exc}")
+    if broken:
+        raise RuntimeError("模板编译失败：" + " | ".join(broken))
+    success(f"Templates loaded ({len(names)} compiled)")
+
+    if prepare_database is None:
+        # 没有装配层提供数据库步骤（极少见：只有不碰数据库的测试才这样）
+        logger.warning("No database bootstrapper injected; skipping DB initialization")
+    else:
+        prepare_database()
+
+    for label, hook in hooks:
+        hook()
+        success(label)
+
+    logger.info("Startup complete in %.0f ms (pid=%s, %d startup hook(s), locale=%s)",
+                (time.monotonic() - started_at) * 1000.0,
+                os.getpid(), len(hooks), config.get("locale", "en"))

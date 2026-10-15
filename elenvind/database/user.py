@@ -1,0 +1,177 @@
+"""user 表：注册、登录查询、资料修改、逻辑删除与密码升级。
+
+读取约定：
+- 邮箱匹配使用 COLLATE NOCASE，登录/查重对大小写不敏感；
+  写入侧（`modules/auth/routes.py`、`modules/users/routes.py`）负责先
+  `normalize_email` 再落库。
+- 所有"取用户"查询都过滤 is_deleted = 0，已注销账号视为不存在。
+- **读走 `connect()`，写走 `write_tx()`**：写事务由 Core 的唯一写入口提供
+  跨进程 flock 与 BEGIN IMMEDIATE（见 database.write_tx）。
+"""
+import time
+import uuid
+
+from .connection import connect
+from .transaction import write_tx
+
+
+def _invalidate_user_count():
+    """用户数变化后让页脚缓存立即失效（个人站写操作极少，直接清空）。"""
+    global _user_count_cache
+    _user_count_cache = (0.0, _user_count_cache[1])
+
+
+def create_user(nickname: str, email: str, password_hash: str) -> int:
+    """写入新用户，返回自增 id。
+
+    email 列的 UNIQUE 约束是查重的最终权威：并发注册由 SQLite 抛
+    sqlite3.IntegrityError，调用方（`modules/auth/routes.py`）据此返回
+    "已存在"提示，而不是 500。这里不做 SELECT 预检查，避免 TOCTOU 竞态。
+
+    **邮箱在这里统一规范化**（而不是依赖调用方先转小写）：
+    大小写不敏感现在靠"数据规范化"实现（查询改用 BINARY 比较以命中索引，
+    见 `get_user_by_email`），如果写入侧漏了一处，就会存进大写邮箱并导致
+    查不到 —— 把不变式收在唯一的写入原语里，调用方就不可能漏。
+    """
+
+    with write_tx() as conn:
+        cursor = conn.execute(
+            "INSERT INTO user (nickname, email, password, created_at, nickname_changed_at) "
+            "VALUES (?, ?, ?, ?, NULL)",
+            (nickname, normalize_email(email), password_hash,
+             time.strftime("%Y-%m-%dT%H:%M:%S"))
+        )
+        new_id = cursor.lastrowid
+    # 提交成功之后才让缓存失效（提交失败不该影响缓存语义）
+    _invalidate_user_count()
+    return new_id
+
+
+def get_user_by_email(email: str):
+    """按邮箱查活跃用户（大小写不敏感），用于登录与注册查重。
+
+    **不用 `COLLATE NOCASE`**：`user.email` 的隐式 UNIQUE 索引是 BINARY 排序规则，
+    而 `email = ? COLLATE NOCASE` 的排序规则与之不匹配 -> 索引用不上 ->
+    **每次登录/注册/改邮箱都全表扫描 user 表**（EXPLAIN QUERY PLAN 实测 `SCAN user`）。
+
+    大小写不敏感靠"数据规范化"而不是"查询时比较"：写入侧一律经
+    `normalize_email()` 转小写，v4 迁移也把历史数据统一成小写，
+    因此这里的入参先转小写、再用 BINARY 比较即可命中索引
+    （实测 `SEARCH user USING INDEX sqlite_autoindex_user_1 (email=?)`）。
+    """
+
+    with connect() as conn:
+        return conn.execute(
+            "SELECT * FROM user WHERE email = ? AND is_deleted = 0",
+            (normalize_email(email),)
+        ).fetchone()
+
+
+def get_user_by_id(user_id: int):
+    """按 id 查活跃用户，用于每次请求的会话鉴权。"""
+    with connect() as conn:
+        return conn.execute(
+            "SELECT * FROM user WHERE id = ? AND is_deleted = 0", (user_id,)
+        ).fetchone()
+
+
+def update_user_profile(user_id: int, nickname=None, email=None):
+    """**原子地**更新昵称与/或邮箱（一个事务，要么都成功要么都不变）。
+
+    为什么需要它：昵称与邮箱各自一个 `UPDATE` 会开两个连接、两个事务，
+    于是"同时改昵称和邮箱"可能只成功一半 —— 典型场景是并发注册者抢走了
+    新邮箱：邮箱更新抛 IntegrityError 回滚，而昵称那条**已经提交**，
+    用户看到"邮箱已被占用"，昵称却已经悄悄改了，页面显示的还是旧行。
+
+    传 `None` 表示"这一项不改"。返回是否实际更新了行。
+    """
+
+    fields = []
+    params = []
+    if nickname is not None:
+        fields.append("nickname = ?")
+        params.append(nickname)
+        fields.append("nickname_changed_at = ?")
+        params.append(time.strftime("%Y-%m-%dT%H:%M:%S"))
+    if email is not None:
+        fields.append("email = ?")
+        params.append(normalize_email(email))
+    if not fields:
+        return False
+    params.append(user_id)
+    with write_tx() as conn:
+        cursor = conn.execute(
+            f"UPDATE user SET {', '.join(fields)} WHERE id = ? AND is_deleted = 0",
+            params)
+        updated = bool(cursor.rowcount)
+    return updated
+
+
+def change_password_and_logout_all(user_id: int, new_password_hash: str) -> None:
+    """改密 + 作废该账号**全部**会话 —— **同一个写事务**。
+
+    分成两步（先 `update_user_password()` 再清会话）会留下一个窗口：密码已经
+    生效、旧会话却仍然有效 —— "改密即全端下线"的承诺在这段时间里不成立。
+    浏览器侧的 Cookie 由 Core 清理（模块调用 `request.invalidate_session_cookie()`）。
+    """
+    with write_tx() as conn:
+        conn.execute("UPDATE user SET password = ? WHERE id = ? AND is_deleted = 0",
+                     (new_password_hash, user_id))
+        conn.execute("DELETE FROM session WHERE user_id = ?", (user_id,))
+
+
+def delete_user_account(user_id: int, email: str) -> None:
+    """删号：清登录流水 + 逻辑删除账号 + 作废全部会话 —— **同一个写事务**。
+
+    步骤顺序有意义：先按**旧邮箱**清 `login_attempts`（里面带 IP），再把邮箱改写成
+    占位值 —— 反了就再也按邮箱找不到那些流水了。
+
+    逻辑删除的语义是昵称置为 `Ghost`、邮箱与密码清空、`is_deleted = 1`。`email` 列有
+    UNIQUE 约束，所以用占位地址避免与新注册冲突；占位地址必须**不可预测、也不可注册**：
+    随机 UUID + `.invalid`（RFC 2606 保留、永不解析）。已注销账号的评论仍留在站内，
+    只显示占位昵称。
+
+    `WHERE ... AND is_deleted = 0` 让"重复删号"明确报错并回滚整个事务，而不是反复改写
+    同一行。
+    """
+    placeholder_email = f"deleted+{uuid.uuid4().hex}@deleted.invalid"
+    with write_tx() as conn:
+        conn.execute("DELETE FROM login_attempts WHERE email = ? COLLATE NOCASE", (email,))
+        cursor = conn.execute(
+            "UPDATE user SET nickname = 'Ghost', email = ?, password = '', is_deleted = 1 "
+            "WHERE id = ? AND is_deleted = 0",
+            (placeholder_email, user_id)
+        )
+        if cursor.rowcount == 0:
+            # 抛出去 → write_tx() 回滚整个事务，调用方拿到 ValueError
+            raise ValueError(f"User {user_id} does not exist or is already deleted")
+        conn.execute("DELETE FROM session WHERE user_id = ?", (user_id,))
+    _invalidate_user_count()
+
+
+# 页脚用户数缓存：每个页面渲染都要用，但没必要每个请求都查一次库
+_USER_COUNT_TTL = 30.0
+_user_count_cache = (0.0, 0)
+
+
+def get_user_number():
+    """活跃用户总数（用于页脚展示），已注销用户不计入；结果缓存 30 秒。"""
+    global _user_count_cache
+    cached_at, cached_value = _user_count_cache
+    now = time.time()
+    if cached_at and now - cached_at < _USER_COUNT_TTL:
+        return cached_value
+    with connect() as conn:
+        row = conn.execute("SELECT COUNT(*) FROM user WHERE is_deleted = 0").fetchone()
+    value = row[0] if row else 0
+    _user_count_cache = (now, value)
+    return value
+
+
+def normalize_email(email) -> str:
+    """邮箱规范化：strip + 小写（**写入与查询都必须经过它**）。
+
+    大小写不敏感现在靠"数据规范化"实现（查询用 BINARY 比较以命中索引），
+    所以写入侧漏一处就会存进大写邮箱并导致查不到 —— 定义收在数据层里。
+    """
+    return str(email or "").strip().lower()

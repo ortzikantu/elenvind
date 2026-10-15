@@ -1,0 +1,249 @@
+# ============================================================
+# Elenvind 配置模板
+# 用 `elenvind init` 生成（它会复制本文件并按 --domain/--title 填好两行），
+# 或手工复制这个文件为站点实例根目录下的 config.toml。
+# 所有键的作用见 manual/CONFIGURATION.md；配置在启动时校验一次，
+# 不合法会直接拒绝启动（不会跑到某个页面才报错）。
+# 路径类配置一律相对**实例根目录**（`ELENVIND_ROOT` → 向上找到含 config.toml 的
+# 目录 → 当前目录）。
+# ============================================================
+
+locale = "zh"
+title = "Elenvind"
+copyright = "Your Name"
+keywords = ["blog", "personal"]
+description = "My personal website"
+
+# 站点对外地址：canonical / robots.txt / sitemap.xml 里所有绝对 URL 的唯一来源。
+# 留空则这些文件不输出绝对地址（绝不从请求的 Host 头推导，防 Host 头投毒）。
+# 必须是不带结尾斜杠的 http(s) 绝对地址。
+site_url = "https://example.com"
+
+# 管理员账号 id：拥有删 / 恢复任意评论的权限。
+# 缺失、为 null 或指向不存在的用户时**没有管理员**（启动日志会点名），
+# 此时没人能涂黑评论。
+admin_user_id = 1
+
+admin_badge = "ADMIN"   # 管理员徽章文字（admin_user_id 用户昵称旁）；留空彻底不显示，缺失时默认 "BIG BOSS"
+deleted_user_nickname = "Journeyed On"
+max_length = 1000   # 单条评论最大长度（字符）：textarea 与后端双重限制
+max_comment_depth = 32             # 评论最大层级（顶层 = 1）；**硬约束**：写入侧在事务内校验，超层回复被拒
+                                   # 合法区间 1–10000；**没有"不限层级"选项**，写 0 会拒绝启动
+max_comments_per_article = 1000    # 单篇文章评论总数上限（防无限膨胀）
+
+# 是否开放公开注册；false 时 /register 明确提示"已关闭注册"
+registration_enabled = true
+
+###################################################################################################
+# 服务端会话过期
+#
+# 会话必须同时满足两个维度才有效，任一超时即失效并当场从库里删除：
+#   绝对过期 session_absolute_days —— 创建后活够这么多天就要重新登录，
+#                                     与活跃程度无关，是 token 泄露后风险窗口的硬上限；
+#   滑动过期 session_idle_days     —— 闲置超过这么多天即失效，
+#                                     有效访问会刷新 last_seen，常用设备不会被踢。
+#
+# 设为 0 = 该维度**不过期**。
+# ⚠️ 两个都设 0 就回到"会话永久有效"：token 泄露后攻击者可无限期使用，
+#    除非你完全清楚代价，否则不要这么配。
+#
+# 超过 3650 天（10 年）会被启动校验拒绝——那基本等于不想过期，请显式写 0。
+###################################################################################################
+session_absolute_days = 30         # 默认 30 天
+session_idle_days = 15             # 默认 15 天不活跃即失效
+
+# 安全响应头见文件末尾的 [security] 表（由 Core 在响应收尾阶段统一注入，
+# 模块层完全不感知）。注意：TOML 的 [table] 会"吃掉"它之后的所有顶层键，
+# 因此本文件把所有表都排在这些顶层键之后。
+
+# 请求体上限（字节）：POST 表单最大体积，超出返回 413
+max_body_size = 1048576            # 1 MB
+
+# 数据库文件（相对实例根；也可用环境变量 ELENVIND_DB 覆盖，用于多环境隔离）。
+# 默认放在 data/ 子目录：systemd 单元只把 data/、logs/、backups/ 授予服务账号写
+# 权限，代码与配置目录保持只读（见包内 resources/elenvind.service）。
+# 目录需要预先存在（应用会创建它，但在只读根目录下创建不了）。
+database = "data/sqlite.db"
+
+# 内容目录（相对实例根）
+articles_dir = "articles"
+custom_pages_dir = "custom"
+
+# Jinja2 模板目录：默认就是包内那份 `elenvind/templates`（随包升级），
+# 因此**一般不用写**；只有要整体替换成自己的一套模板时才加这一行。
+
+[server]
+    # 监听地址。**保持回环**：对外服务与 TLS 一律由前面的反向代理提供
+    # （任意反代都行，见 manual/HOSTING.md）。改成非回环地址会让端口可被直连，
+    # 从而绕过 TLS/HSTS/边缘限速与连接级慢连接防护 —— 启动日志会明确告警。
+    host = "127.0.0.1"
+    port = 6789
+    # 进程/线程数：`elenvind serve` 读它，`--workers` 可覆盖。
+    # 0 = 按**物理核心**自适应（上限 8），正数则完全按你写的来。
+    # 注意语义随服务器而定：Gunicorn/uWSGI 是进程数，Waitress 是线程数。
+    # 所有写事务经过 write_tx()（flock 跨进程排他 + BEGIN IMMEDIATE）：多 worker
+    # 是安全的，但**写是串行的**，加 worker 只对读有帮助。
+    workers = 0
+    # 受信代理列表（唯一来源）：仅当直连对端在此列表中时，才采信
+    # X-Forwarded-For（客户端 IP）与 X-Forwarded-Proto（https 判定），
+    # 防伪造绕过登录限流、骗到 Secure Cookie/HSTS。nginx 反代场景保持回环
+    # 默认即可；若代理与本站不在同一台机器，请改为代理的实际地址。
+    trusted_proxies = ["127.0.0.1", "::1"]
+    # 是否给会话/CSRF Cookie 加 __Host- 前缀（要求全程 HTTPS + Path=/ + 无 Domain）。
+    # 仅在站点确定只能通过 HTTPS 访问时开启，否则浏览器会拒收这些 Cookie。
+    cookie_prefix = false
+
+    # 启动器（`elenvind serve` / Gunicorn）的 worker 超时（秒，5–120）：单条连接占用
+    # 一个 worker 超过这个时间就由 master 杀掉并重启。它属于**启动器**，不是应用的
+    # 安全边界 —— 连接级慢连接由反向代理承担；换别的 WSGI 服务器时它不生效。
+    timeout = 30
+
+[pagination]
+    per_page = 6
+
+[comment_limits]
+    max_per_user = 5        # 窗口内单用户最多评论数
+    max_per_ip = 10         # 窗口内单 IP 最多评论数
+    window_seconds = 60
+
+[login_limits]
+    max_email_failures = 5      # 单邮箱失败上限（主防线，防定向爆破）
+    email_window_seconds = 86400
+    max_ip_failures = 20        # 单 IP 失败上限（辅助防线）
+    ip_window_seconds = 900
+    max_global_failures = 200   # 全站失败上限（分布式爆破最后闸门）
+    global_window_seconds = 900
+
+[register_limits]
+    max_per_ip = 5          # 注册 IP 限流：窗口内最多注册尝试次数
+    window_seconds = 3600
+
+[static]
+    # 以下四项都是**你自己托管**的资源地址（CDN / 图床 / 自己的 Web 服务器）：
+    # 本服务不发出任何静态文件；留空就不输出对应的 HTML 节点。
+    #
+    # 外观基线：把 manual/style.example.css 放到你的服务器，
+    # 再填 css = "https://cdn.example.com/site.css"。
+
+    # 全站样式表；留空 = 不输出 <link rel="stylesheet">（页面无样式）
+    css = ""
+
+    # 站点图标；留空 = 不输出 <link rel="icon">
+    favicon = ""
+
+    # 页头站标图标（与站名并排）；留空则不显示图标
+    logo = ""
+
+    # 首页 Hero 大图；留空则不显示 hero 区
+    hero = ""
+
+[params]
+  intro = "Hi, welcome to my site."
+
+###################################################################################################
+
+  [[params.nav]]
+    name = "About"
+    url = "/about"
+  [[params.nav]]
+    name = "Statement"
+    url = "/statement"
+
+###################################################################################################
+
+  # 社交链接：icon 留空则退化为显示名称文字（本服务不托管这些图标）。
+  # 放好自己的 SVG/PNG 后填 URL，例如 icon = "https://cdn.example.com/codeberg.svg"
+  [[params.social]]
+    name = "Codeberg"
+    url = "https://codeberg.org/"
+    icon = ""
+  [[params.social]]
+    name = "Github"
+    url = "https://github.com/"
+    icon = ""
+  
+###################################################################################################
+
+  [[params.projects]]
+    name = "Elenvind"
+    url = "https://codeberg.org/yourname/elenvind"
+    description = "本站运行的基石：只用 Python 标准库 + WSGI + SQLite + Jinja2 构建。"
+
+###################################################################################################
+
+[logging]
+    level = "info"               # 可选值：debug, info, warning, error, critical
+    file = "logs/app.log"        # 日志文件路径（相对实例根）
+    # 应用内轮转开关。默认 false = 只写当前文件、由外部 logrotate 负责轮转
+    # （多 worker 各持一个 RotatingFileHandler 时同时轮转会互相截断/丢行；
+    #  仓库的 manual/logrotate.conf 是一份可直接用的示例）。
+    # 单 worker 或本地开发可以设 true，此时下面两项生效。
+    rotate = false
+    max_bytes = 10485760         # 10 MB（rotate = true 时生效）
+    backup_count = 5             # rotate = true 时生效
+
+###################################################################################################
+# 安全响应头（由 Core 在响应收尾阶段统一注入，模块层不感知）
+#
+# 这些头**默认已经生效**，本节只需按需调整；整节删掉也能正常启动。
+# 注意：这里只覆盖"被动安全头"，CSRF / 会话 / Host 防护等主动安全不受影响。
+#
+# 本表（及子表 [security.csp]）必须放在文件最后：TOML 的表会"吃掉"
+# 它之后的所有顶层键。
+###################################################################################################
+
+[security]
+
+# 是否下发 Content-Security-Policy。false = 完全不下发（不推荐）。
+csp_enabled = true
+
+# Permissions-Policy：关闭浏览器能力。
+# 留空字符串 = 不下发该头；整行删掉 = 用应用默认（关得更全）。
+permissions_policy = "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), usb=(), xr-spatial-tracking=(), interest-cohort=()"
+
+# HSTS 是否下发（本模板显式设为 false，即不下发）。
+# 下发的两个条件都要满足：hsts_enabled = true **且**请求是 HTTPS —— 在 HTTP 上下发
+# 无意义（浏览器直接忽略），而站点仍提供 HTTP 访问时误发会把访客锁死在 HTTPS。
+# 把这一行**整行删掉**（而不是写 false）时，取值跟随 [server].cookie_prefix：
+# 开了 __Host- 前缀就说明站长已把站点约束在 HTTPS 上。
+hsts_enabled = false
+hsts_max_age = 31536000          # 秒；建议先设小一点（如 300）确认无误再调大
+hsts_include_subdomains = false  # 有子域且全部支持 HTTPS 时再开
+
+# CSP 指令表：只覆盖想改的条目，其余保持默认。
+#
+# 默认值（不写 [security.csp] 时）：
+#   default-src 'self'
+#   script-src  'none'                    <- 本站 Zero-JS，直接掐断脚本执行链
+#   style-src   'self'                    <- 模板里没有内联样式，见下方说明
+#   img-src     'self' data: http: https:  <- 默认允许外链图片（减轻服务器压力）
+#   media-src   'self' http: https:        <- 默认允许外链视频
+#   font-src    'self'
+#   connect-src 'self'
+#   object-src  'none'
+#   base-uri    'none'
+#   form-action 'self'
+#   frame-ancestors 'none'
+#
+# 关于 style-src：样式表由**你自己托管**（本服务不发出任何静态文件）。
+# 同源没问题；放到 CDN 就必须把那个来源显式加进 style-src：
+#   style-src = ["'self'", "https://cdn.example.com"]
+#
+# 用法：
+#   - 收紧为**显式主机 allowlist**（更保护访问者隐私，但外链只能来自这些主机）：
+#         img-src = ["'self'", "data:", "https://cdn.example.com"]
+#         media-src = ["'self'", "https://videos.example.com"]
+#     守卫只允许"收窄"：删掉默认里的 http:/https: 通配、换成具体主机；
+#     裸 "http:" / "https:" / "*" 会被拒绝（那等于允许任意第三方）。
+
+#   - 只允许站内：img-src = ["'self'", "data:"] / media-src = ["'self'"]
+#   - 关掉：object-src = false                    （该指令整条不输出）
+#   - 字符串也行：style-src = "'self' https://cdn.example.com"
+#
+# 把图片/视频放到 CDN 时，同理也要把来源加进 img-src / media-src，
+# 否则页面会被自己的 CSP 拦掉。
+[security.csp]
+# 下面两行是默认值，写出来只为示意；不改可以整段删掉。
+# img-src = ["'self'", "data:", "https://cdn.example.com"]
+# media-src = ["'self'", "https://videos.example.com"]
+

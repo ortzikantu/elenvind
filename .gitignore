@@ -1,0 +1,38 @@
+# Python 运行期产物
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境与本地环境变量
+venv/
+.venv/
+.env
+
+# 构建与分发产物
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 静态检查缓存
+.ruff_cache/
+
+# 站点运行期数据（数据库 / 日志 / 在线备份）：属于实例，不进版本库
+data/
+logs/
+backups/
+*.db
+*.db-*
+*.write.lock
+*.pre-v*.db
+
+# 私钥与证书：任何情况下都不进版本库（代理侧证书副本、本地调试证书也一样）
+*.key
+*.pem
+*.crt
+certs/
+tls/
+
+# 测试与验证用的临时目录
+.testtmp/
+.smoketmp/

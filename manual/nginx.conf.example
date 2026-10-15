@@ -1,0 +1,94 @@
+# Elenvind 反向代理示例（nginx）
+#
+#   sudo cp manual/nginx.conf.example /etc/nginx/conf.d/elenvind.conf
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# 这份配置只做**反向代理该做的事**：终结 TLS、转发、掐掉慢连接。
+# 应用层防护（认证 / CSRF / XSS / 限流 / 请求体上限 / 安全响应头）全部由
+# Elenvind 自己提供，因此本文件里没有也不需要有业务规则。
+#
+# 其他反代（Caddy / Apache / HAProxy）的等价最小配置见 manual/HOSTING.md。
+
+# 下面两条 zone 指令只允许出现在 **http** 上下文。本文件被 conf.d/*.conf
+# 或站点配置 include 进 http 块，因此位置正确；但**不要**在多个站点文件里
+# 重复定义同名 zone（nginx 会报 duplicate zone）。
+limit_req_zone $binary_remote_addr zone=elenvind_auth:10m rate=20r/m;
+limit_conn_zone $binary_remote_addr zone=elenvind_conn:10m;
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    # nginx >= 1.25.1 的写法；旧版本请改用 `listen 443 ssl http2;` 并删掉这一行
+    http2 on;
+    server_name example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    # 不泄漏自身版本；上游的 `Server: gunicorn`（不含版本号）无害，可按需隐藏：
+    # proxy_hide_header Server;
+    server_tokens off;
+
+    # ------------------------------------------------------------------
+    # 连接级防护：**必需**。应用用 Gunicorn 的 sync worker，慢连接会占住
+    # worker 直到 Gunicorn 的 timeout（默认 30s），这一层只能由代理提供。
+    # ------------------------------------------------------------------
+    client_header_timeout 10s;
+    client_body_timeout   10s;
+    send_timeout          10s;
+    keepalive_timeout     30s;
+
+    # 请求体：应用先返回自己的 413（有日志、有守卫），这里的值只是兜底，
+    # 因此必须**大于**应用上限（config.toml 的 max_body_size，默认 1 MiB）。
+    client_max_body_size 2m;
+
+    access_log /var/log/nginx/elenvind.access.log;
+    error_log  /var/log/nginx/elenvind.error.log warn;
+
+    location / {
+        limit_conn elenvind_conn 20;
+        proxy_pass http://127.0.0.1:6789;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection        "";
+
+        proxy_connect_timeout 5s;
+        # 必须 **大于** Gunicorn 的 timeout（默认 30s）：让应用先失败并给出
+        # 明确响应，而不是两边同时超时（客户端只看到 504，而 worker 仍被占着）
+        proxy_read_timeout 40s;
+        proxy_send_timeout 40s;
+    }
+
+    # 存活探针：不碰数据库、不写访问日志。
+    # 就绪探针请用 `GET /`（页面渲染要读数据库）。
+    location = /healthz {
+        access_log off;
+        proxy_pass http://127.0.0.1:6789/robots.txt;
+    }
+
+    # 可选的边缘限流（应用内本身有邮箱 / IP / 全站三闸门，这一层只是削峰）
+    location = /login {
+        limit_req  zone=elenvind_auth burst=5 nodelay;
+        limit_conn elenvind_conn 10;
+        proxy_pass http://127.0.0.1:6789;
+    }
+
+    location = /register {
+        limit_req  zone=elenvind_auth burst=3 nodelay;
+        limit_conn elenvind_conn 10;
+        proxy_pass http://127.0.0.1:6789;
+    }
+}

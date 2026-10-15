@@ -1,0 +1,116 @@
+# Elenvind 的分发元数据与工具配置。
+#
+# 这里是**唯一**的版本来源：`elenvind/core/version.py` 通过 importlib.metadata
+# 读取它（源码检出时改为解析本文件）。改版本号只改上面 [project] 里的 version。
+#
+#   python -m build            # 产出 dist/*.whl 与 dist/*.tar.gz
+#   twine check dist/*         # 发布前自检元数据
+#   twine upload dist/*        # 发布到 PyPI
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elenvind"
+version = "1.0.0"
+description = "A security-first personal website and blog server built on the Python standard library, WSGI, SQLite and Jinja2."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "Hao Wu", email = "hao.wu@ortzikantu.com" }]
+keywords = [
+    "blog",
+    "website",
+    "wsgi",
+    "sqlite",
+    "jinja2",
+    "server-rendered",
+    "no-javascript",
+    "self-hosted",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Web Environment",
+    "Framework :: WSGI",
+    "Intended Audience :: End Users/Desktop",
+    "Natural Language :: Chinese (Simplified)",
+    "Natural Language :: English",
+    "Natural Language :: Japanese",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content :: News/Diary",
+    "Topic :: Internet :: WWW/HTTP :: WSGI :: Application",
+]
+
+# 运行时依赖刻意保持极少：标准库 + 下面三个。**WSGI 服务器不在其中** ——
+# 它由 `pip install elenvind[gunicorn]` 之类的 extra 提供，这样换服务器
+# （Gunicorn / Waitress / uWSGI / Hypercorn）永远不会影响应用的安全语义。
+dependencies = [
+    "Jinja2>=3.1,<4",
+    "Markdown>=3.5,<4",
+    "MarkupSafe>=2.1",
+]
+
+[project.optional-dependencies]
+gunicorn = ["gunicorn>=23"]
+waitress = ["waitress>=3.0"]
+uwsgi = ["uWSGI>=2.0.28"]
+hypercorn = ["hypercorn>=0.17"]
+dev = ["ruff>=0.9"]
+
+[project.urls]
+Homepage = "https://codeberg.org/ortzikantu/elenvind"
+Repository = "https://codeberg.org/ortzikantu/elenvind"
+Issues = "https://codeberg.org/ortzikantu/elenvind/issues"
+Documentation = "https://codeberg.org/ortzikantu/elenvind/src/branch/main/manual/README.md"
+Mirror = "https://github.com/ortzikantu/elenvind"
+Releases = "https://github.com/ortzikantu/elenvind/releases"
+
+[project.scripts]
+elenvind = "elenvind.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["elenvind*"]
+namespaces = false
+
+# 随包分发的东西：模板、界面文案（i18n）、以及 init/install 用的资源。
+# 站点实例（config.toml / articles / custom / data / logs / backups）**绝不打包**。
+[tool.setuptools.package-data]
+elenvind = ["templates/**/*.html", "i18n/*.toml", "resources/*"]
+
+[tool.ruff]
+# 中文注释与文案占宽，110 比 100 更贴近本项目的实际排版（超长 SQL 字符串除外）
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+# 只启用"真的会导致缺陷"的规则集，不追求风格洁癖：
+#   E/W   pycodestyle 的错误与告警
+#   F     pyflakes（未定义名、未用导入等）
+#   I     isort（导入顺序）
+#   B     flake8-bugbear（易错写法）
+#   C4    comprehensions
+#   SIM   flake8-simplify
+#   RUF   ruff 自有规则（`__all__` 排序、无用 noqa 等）
+#   UP    pyupgrade
+select = ["E", "W", "F", "I", "B", "C4", "SIM", "RUF", "UP"]
+
+ignore = [
+    # `datetime.now()` 不带 tz：`created_at` / `nickname_changed_at` 是既有的
+    # 本地时间字符串格式，改成 aware 会改变历史数据的语义（属于数据迁移，
+    # 不属于缺陷修复）。规则本身未启用，这里保留说明以免有人误开。
+    "DTZ005",
+    # 全角标点：本项目注释与文案以中文为主，全角括号/冒号/逗号是刻意的排版，
+    # 不是"看起来像 ASCII 的混淆字符"。
+    "RUF001", "RUF002", "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里允许 assert（ruff 默认不报）；夹具里保留较宽的防御性写法
+"tests/*" = ["BLE001"]

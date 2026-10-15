@@ -1,0 +1,101 @@
+# CI：静态检查 + 全量测试 + 启动冒烟。
+#
+# 只跑 Linux：应用只支持提供 `fcntl.flock` 的 POSIX 系统（跨进程写互斥靠文件锁），
+# 因此在 Windows / macOS runner 上跑测试只会得到"平台不支持"的噪音。
+#
+# 主仓库在 Codeberg；这里同时服务于镜像仓库与发布流水线（见 manual/RELEASE.md）。
+
+name: ci
+
+on:
+  push:
+    branches: [main, master, trunk]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 安装依赖（含开发工具）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: 静态检查
+        run: ruff check .
+
+      - name: 全量测试
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: 打包元数据可构建
+        run: |
+          pip install build
+          python -m build
+          python - <<'PY'
+          import glob, tarfile, zipfile
+
+          wheel = glob.glob("dist/*.whl")[0]
+          sdist = glob.glob("dist/*.tar.gz")[0]
+          wheel_names = zipfile.ZipFile(wheel).namelist()
+          with tarfile.open(sdist) as archive:
+              sdist_names = archive.getnames()
+
+          leaked = [n for n in wheel_names
+                    if n.endswith("config.toml") or "/articles/" in n
+                    or "/custom/" in n or "/data/" in n]
+          assert not leaked, f"wheel 里混进了站点实例数据：{leaked}"
+
+          leaked = [n for n in sdist_names
+                    if n.endswith("/config.toml") or "/articles/" in n
+                    or "/custom/" in n or "/data/" in n or "/logs/" in n
+                    or "/backups/" in n]
+          assert not leaked, f"sdist 里混进了站点实例数据：{leaked}"
+
+          for need in ("elenvind/templates/base.html", "elenvind/i18n/en.toml",
+                       "elenvind/resources/config.example.toml"):
+              assert any(n.endswith(need) for n in wheel_names), f"wheel 缺少 {need}"
+          print("产物检查通过：无站点数据，包数据齐全")
+          PY
+
+      - name: 启动冒烟（console script + 只监听回环）
+        run: |
+          set -e
+          pip install -e .
+          WORK="$RUNNER_TEMP/instance"
+          mkdir -p "$WORK"/{data,logs,backups,articles,custom}
+          cp elenvind/resources/config.example.toml "$WORK/config.toml"
+          cd "$WORK"
+          nohup elenvind serve --bind 127.0.0.1:6789 --yes > serve.log 2>&1 &
+          for _ in $(seq 1 40); do
+            curl -sf -o /dev/null http://127.0.0.1:6789/ && break
+            sleep 0.5
+          done
+          for path in / /login /robots.txt /sitemap.xml; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:6789$path")"
+            echo "$path -> $code"
+            [ "$code" = "200" ]
+          done
+          # 静态路径必须 404：本服务不发出任何静态文件
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6789/css/style.css)" = "404" ]
+          grep -q "TLS is terminated by the reverse proxy" serve.log
+          echo "冒烟通过"

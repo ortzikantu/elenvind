@@ -1,0 +1,172 @@
+"""Elenvind 持久化基座（唯一 SQLite 边界）。
+
+    app（装配层）─┬─► database ──► SQLite
+    modules ──────┘
+
+铁律（由 tests/test_architecture.py 守卫）：
+
+- **只有本包**可以 `import sqlite3`、执行 SQL、`BEGIN`/`COMMIT`；
+- 所有写操作必须经 `transaction.write_tx()`（跨进程 flock + BEGIN IMMEDIATE）；
+- 读操作走 `connection.connect()`（不参与 flock）；
+- 本包**不认识** `core`、不认识 `modules`：不读配置、不处理 HTTP/Cookie/模板；
+  数据库路径由装配层 `connection.configure()` 注入。
+
+数据领域（按持久化对象组织，而不是按 HTTP 动作）：
+
+| 模块 | 数据对象 |
+|---|---|
+| `connection` | 路径 / 锁文件 / 只读连接 |
+| `transaction` | `write_tx()` 唯一写入口 |
+| `migration` | schema 定义、`user_version` 迁移、`init_db()` |
+| `user` | `user` 表 + 邮箱规范化 |
+| `session` | `session` 表（绝对 + 滑动过期） |
+| `comment` | `comment` 表（层级 / 树展开 / 涂黑） |
+| `comment_rate` | 评论限流记账 + 原子写入 |
+| `auth` | `login_attempts` / `register_attempts`（认证尝试流水） |
+| `maintenance` | 机会式清理（独立写事务） |
+| `backup` | 在线一致性备份（运维入口，只读源库） |
+
+`modules` 可以 `from ...database import X` 或 `from ...database.comment import Y`；
+装配层把本包**整个**作为 store 注入给 `core.session`（`store=database`）。
+"""
+from __future__ import annotations
+
+from . import (
+    auth,
+    backup,
+    comment,
+    comment_rate,
+    connection,
+    maintenance,
+    migration,
+    session,
+    transaction,
+    user,
+)
+from .auth import (
+    COOLDOWN_BASE_SECONDS,
+    COOLDOWN_MAX_SECONDS,
+    REGISTER_RETENTION_DAYS,
+    RETENTION_DAYS,
+    cleanup_old_attempts,
+    cleanup_old_login_attempts,
+    complete_login_success,
+    register_attempt_exceeded,
+    reserve_login_attempt,
+    try_register_attempt,
+)
+from .backup import BackupError, backup_to
+from .comment import (
+    comment_depth,
+    flatten_comment_tree,
+    get_comment_by_id,
+    get_comments_by_article,
+    redact_comment,
+    update_comment_content,
+)
+from .comment_rate import cleanup_old_comment_attempts, try_post_comment
+from .connection import (
+    DEFAULT_DB_PATH,
+    IntegrityError,
+    configure,
+    connect,
+    get_connection,
+    journal_mode,
+    lock_path_for,
+)
+from .maintenance import prune
+from .migration import SCHEMA_VERSION, MigrationError, init_db
+from .session import (
+    DEFAULT_ABSOLUTE_DAYS,
+    DEFAULT_IDLE_DAYS,
+    cleanup_expired_sessions,
+    create_session,
+    delete_session,
+    get_session_user,
+    rotate_session,
+)
+from .transaction import write_tx
+from .user import (
+    change_password_and_logout_all,
+    create_user,
+    delete_user_account,
+    get_user_by_email,
+    get_user_by_id,
+    get_user_number,
+    normalize_email,
+    update_user_profile,
+)
+
+
+def db_path():
+    """**当前生效**的数据库路径（实时读取）。
+
+    为什么是函数而不是常量：`configure()` 会替换连接层里的路径，而
+    `from .connection import DB_PATH` 这种再导出只是 **import 时刻的快照**。
+    用它打日志/做判断会拿到过期值 —— 真实案例：启动日志打印的是默认路径
+    `<项目根>/sqlite.db`，而实际库在 `config.toml` 指定的 `data/sqlite.db`，
+    排障时按日志去找文件会扑空。需要路径就调用本函数（它读的是真值）。
+    """
+    return connection.DB_PATH
+
+
+__all__ = [
+    "COOLDOWN_BASE_SECONDS",
+    "COOLDOWN_MAX_SECONDS",
+    "DEFAULT_ABSOLUTE_DAYS",
+    "DEFAULT_DB_PATH",
+    "DEFAULT_IDLE_DAYS",
+    "REGISTER_RETENTION_DAYS",
+    "RETENTION_DAYS",
+    "SCHEMA_VERSION",
+    "BackupError",
+    "IntegrityError",
+    "MigrationError",
+    "auth",
+    "backup",
+    "backup_to",
+    "change_password_and_logout_all",
+    "cleanup_expired_sessions",
+    "cleanup_old_attempts",
+    "cleanup_old_comment_attempts",
+    "cleanup_old_login_attempts",
+    "comment",
+    "comment_depth",
+    "comment_rate",
+    "complete_login_success",
+    "configure",
+    "connect",
+    "connection",
+    "create_session",
+    "create_user",
+    "db_path",
+    "delete_session",
+    "delete_user_account",
+    "flatten_comment_tree",
+    "get_comment_by_id",
+    "get_comments_by_article",
+    "get_connection",
+    "get_session_user",
+    "get_user_by_email",
+    "get_user_by_id",
+    "get_user_number",
+    "init_db",
+    "journal_mode",
+    "lock_path_for",
+    "maintenance",
+    "migration",
+    "normalize_email",
+    "prune",
+    "redact_comment",
+    "register_attempt_exceeded",
+    "reserve_login_attempt",
+    "rotate_session",
+    "session",
+    "transaction",
+    "try_post_comment",
+    "try_register_attempt",
+    "update_comment_content",
+    "update_user_profile",
+    "user",
+    "write_tx",
+]

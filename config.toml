@@ -1,0 +1,186 @@
+locale = "zh"
+title = "Elenvind"
+copyright = "Elenvind"
+keywords = []                      # 留空则不输出 <meta name="keywords">
+description = "A Personal Website Server"
+
+# 站点对外地址：robots.txt / sitemap.xml 里所有绝对 URL 的唯一来源。
+# 绝不从请求的 Host 头推导（Host 由客户端控制，会造成 Host 头投毒）。
+# 留空则这些文件不输出绝对地址；填了必须是不带结尾斜杠的 http(s) 绝对地址。
+site_url = "https://ortzikantu.com"
+
+# 管理员账号 id：可删除/恢复任意评论（不再硬编码为 1）。
+# 缺失或非法时视为"无管理员"，不会静默把权限给 id=1。
+admin_user_id = 1
+
+admin_badge = ""   # 管理员徽章文字（admin_user_id 用户昵称旁）；留空彻底不显示，缺失时默认 "BIG BOSS"
+deleted_user_nickname = "已远行"
+max_length = 1000   # 单条评论最大长度（字符）：textarea 与后端双重限制
+max_comment_depth = 32             # 评论最大层级（顶层 = 1）；**硬约束**：写入侧在事务内校验，超层回复被拒
+max_comments_per_article = 1000    # 单篇文章评论总数上限
+
+registration_enabled = true        # 是否开放公开注册
+
+###################################################################################################
+# 服务端会话过期（两个维度都要满足会话才有效；任一超时即失效并当场删除该会话）
+#
+# 绝对过期：会话创建后活够这么多天就必须重新登录。与活跃程度无关，
+#           这是"token 泄露后风险窗口"的硬上限。
+# 滑动过期：闲置超过这么多天即失效；有效访问会刷新 last_seen，
+#           所以常用设备不会被踢，只是长期不用的会话会自然消失。
+#
+# 设为 0 = 该维度**不过期**。⚠️ 两个都设 0 等于回到"永久有效"：
+# token 一旦泄露，攻击者可以无限期使用。除非你完全清楚代价，否则别这么写。
+#
+# 两者都超过 10 年（3650 天）会被启动校验拒绝（那基本等于不想过期，请显式写 0）。
+###################################################################################################
+session_absolute_days = 30         # 绝对过期：30 天（默认）
+session_idle_days = 15             # 滑动过期：15 天不活跃即失效（默认）
+
+max_body_size = 1048576            # POST 表单体积上限（1 MB），超出返回 413
+database = "data/sqlite.db"             # 相对项目根；也可用环境变量 ELENVIND_DB 覆盖
+articles_dir = "articles"          # 文章目录（相对项目根）
+custom_pages_dir = "custom"            # 自定义页面目录（相对项目根）
+
+# 安全响应头（Core 统一注入，模块不感知）见文件末尾的 [security]：
+# TOML 的表会"吃掉"它之后的所有顶层键，所以所有表都必须排在这些顶层键之后。
+
+[server]
+    host = "127.0.0.1"
+    port = 6789
+    # 进程/线程数：`elenvind serve` 读它，`--workers` 可覆盖。
+    # 0 = 按**物理核心**自适应（上限 8），正数则完全按你写的来。
+    # 所有写事务经过 write_tx()（flock 跨进程排他 + BEGIN IMMEDIATE），
+    # 写是串行的，读不会被写阻塞。
+    workers = 0
+    # 受信代理列表（唯一来源）：仅当直连对端在此列表中时，才采信
+    # X-Forwarded-For（客户端 IP）与 X-Forwarded-Proto（https 判定），
+    # 防止伪造它绕过登录限流或骗到 Secure Cookie / HSTS。反向代理与本站同机时
+    # 保持默认即可；代理在别的机器上就改成它的实际地址；最简 TCP 转发器
+    # （socat / DNAT，不覆写请求头）应设为空表 []。
+    trusted_proxies = ["127.0.0.1", "::1"]
+    # 给会话/CSRF Cookie 加 __Host- 前缀（要求全程 HTTPS + Path=/ + 无 Domain）。
+    # 仅在站点确定只能通过 HTTPS 访问时开启。
+    cookie_prefix = false
+
+    # 启动器（run.py/Gunicorn）的 worker 超时（秒，5–120）：单条连接占用一个 worker
+    # 超过这个时间就由 master 杀掉并重启。它属于**启动器**，不是应用的安全边界 ——
+    # 连接级慢连接由反向代理承担（应用只监听回环）；换别的 WSGI 服务器时它不生效。
+    timeout = 30
+
+[pagination]
+    per_page = 6
+
+[comment_limits]
+    max_per_user = 5        # 窗口内单用户最多评论数
+    max_per_ip = 10         # 窗口内单 IP 最多评论数
+    window_seconds = 60
+
+[login_limits]
+    max_email_failures = 5      # 单邮箱失败上限（主防线）
+    email_window_seconds = 86400
+    max_ip_failures = 20        # 单 IP 失败上限（辅助防线）
+    ip_window_seconds = 900
+    max_global_failures = 200   # 全站失败上限（分布式爆破闸门）
+    global_window_seconds = 900
+
+[register_limits]
+    max_per_ip = 5          # 注册 IP 限流：窗口内最多注册尝试次数
+    window_seconds = 3600
+
+[static]
+    # 以下四项都是**你自己托管**的资源地址（CDN / 图床 / 自己的 Web 服务器）：
+    # 本服务不发出任何静态文件，留空就不输出对应的 HTML 节点。
+    # 外观基线：把 manual/style.example.css 放到你的服务器，再填 css。
+
+    # 全站样式表；留空 = 不输出 <link rel="stylesheet">（页面无样式）
+    css = ""
+
+    # 站点图标；留空 = 不输出 <link rel="icon">
+    favicon = ""
+
+    # 页头站标图标（与站名并排）；留空则不显示图标
+    logo = ""
+
+    # 首页 Hero 大图；留空则整块 hero 区不渲染
+    hero = "https://raw.githubusercontent.com/ortzikantu/homepage/refs/heads/trunk/assets/assets/imgs/hero.jpg"
+
+[params]
+  intro = "Hey there! 👋 很高兴在这里与你相遇。🌟お幸せに~"
+
+###################################################################################################
+
+  [[params.nav]]
+    name = "About"
+    url = "/about"
+  [[params.nav]]
+    name = "Statement"
+    url = "/statement"
+
+###################################################################################################
+
+  # 社交链接：icon 留空则退化为显示名称文字（本服务不托管图标）。
+  # 放好自己的 SVG/PNG 后填 URL，例如 icon = "https://cdn.example.com/codeberg.svg"
+  [[params.social]]
+    name = "Codeberg"
+    url = "https://codeberg.org/"
+    icon = ""
+  [[params.social]]
+    name = "Github"
+    url = "https://github.com/"
+    icon = ""
+  
+###################################################################################################
+
+  [[params.projects]]
+    name = "Elenvind"
+    url = "https://codeberg.org/ortzikantu/elenvind"
+    description = "本站运行的基石，仅用 Python 标准库、SQLite、Gunicorn（WSGI）构建的博客。"
+
+###################################################################################################
+
+[logging]
+    level = "info"               # 可选值：debug, info, warning, error, critical
+    file = "logs/app.log"        # 日志文件路径（相对项目根目录）
+    # 应用内轮转开关。默认 false = 只写当前文件、由外部 logrotate 负责轮转
+    # （多 worker 各持一个 RotatingFileHandler 时同时轮转会互相截断/丢行）。
+    # 单 worker 或本地开发可以设 true，此时下面的 max_bytes / backup_count 生效。
+    rotate = false
+    max_bytes = 10485760         # 10 MB（rotate = true 时生效）
+    backup_count = 5             # rotate = true 时生效
+
+###################################################################################################
+# 安全响应头（Core 在响应收尾阶段统一注入，模块层不感知）
+#
+# 默认值已经够用；这里把关键项显式写出来，方便按需调整。
+# 整节删掉也能正常启动（走代码内默认值）。
+#
+# 注意：TOML 的表会"吃掉"它之后的所有顶层键，因此本文件把所有
+# [table] 都排在前面的顶层键之后。
+###################################################################################################
+
+[security]
+csp_enabled = true                 # false = 完全不下发 CSP（不推荐）
+# 留空字符串 = 不下发该头
+permissions_policy = "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), usb=(), xr-spatial-tracking=(), interest-cohort=()"
+
+# HSTS：开启后**仅 HTTPS 请求**才下发。
+# 若 [server].cookie_prefix = true（__Host- 前缀要求全程 HTTPS），留空即视为启用。
+hsts_enabled = true
+hsts_max_age = 31536000            # 秒；首次上线建议先用 300 确认无误再调大
+hsts_include_subdomains = false    # 子域全部支持 HTTPS 后再开
+
+# CSP 指令覆盖：只写要改的条目，其余用默认值。
+# 默认：script-src 'none'（本站 Zero-JS）、style-src 'self'（模板里没有内联样式，
+#       因此不需要 'unsafe-inline'）、default-src 'self'、
+#       object-src / base-uri / frame-ancestors 'none'。
+# **把样式表放到 CDN 时，必须把那个来源加进 style-src**，否则会被自己的 CSP 拦掉。
+[security.csp]
+# 代码默认已允许外链图片/视频（img-src 'self' data: http: https:、media-src 'self' http: https:），
+# 这是刻意的产品取舍：图片/视频一律由管理员自己托管，本服务不发出静态文件、也不承担带宽。
+#
+# 想收紧（例如只允许自己+指定 CDN，避免访问者向任意第三方发起请求）就显式写出主机：
+#   img-src = ["'self'", "data:", "https://raw.githubusercontent.com"]
+#   media-src = ["'self'", "https://www.w3schools.com"]
+# 守卫（tests/test_doc_consistency.py）只允许"收窄"：拒绝裸 "http:" / "https:" / "*"。
+
