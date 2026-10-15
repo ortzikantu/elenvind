@@ -6,6 +6,8 @@
 # 测试与手册，让"下载源码就能跑"和"审阅它"都成立。
 
 include README.md LICENSE requirements.txt run.py pyproject.toml
+# sdist 也是审阅产物：CI 与发布流水线一起进去（wheel 不含它们）
+recursive-include .github *
 recursive-include manual *
 recursive-include tests *
 recursive-include elenvind/templates *.html

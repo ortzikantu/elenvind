@@ -34,7 +34,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install ruff build
+          pip install ruff build trove-classifiers
 
       - name: tag 必须与 pyproject 的版本一致
         run: |

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
@@ -47,6 +48,38 @@ class Metadata(unittest.TestCase):
         # PEP 639：声明了 license 表达式就不能再放旧的 License 分类器
         self.assertFalse([item for item in project["classifiers"]
                           if item.startswith("License ::")])
+
+    def test_source_version_only_reads_our_own_pyproject(self):
+        """向上找 pyproject 时必须认名字：否则 monorepo 里的 venv 会读到别人的版本。"""
+        from elenvind.core import version as version_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "pyproject.toml").write_text(
+                '[project]\nname = "someone-else"\nversion = "9.9.9"\n',
+                encoding="utf-8")
+            nested = root / "a" / "b"
+            nested.mkdir(parents=True)
+            self.assertEqual(version_module._source_version(nested), "")
+
+            (root / "pyproject.toml").write_text(
+                '[project]\nname = "elenvind"\nversion = "9.9.9"\n', encoding="utf-8")
+            self.assertEqual(version_module._source_version(nested), "9.9.9")
+
+    def test_classifiers_exist_in_the_official_trove_list(self):
+        """分类器必须是官方 trove 列表里的项。
+
+        PyPI 在**上传时**校验它，写错一个就是 `400 Bad Request`，而前一步的
+        `twine check` 不会发现 —— 所以这里提前挡住。本测试在装了
+        `trove-classifiers`（CI 会装）时执行，否则跳过：项目的测试依赖仍然只有标准库。
+        """
+        if importlib.util.find_spec("trove_classifiers") is None:
+            self.skipTest("未安装 trove-classifiers（CI 会安装它）")
+        from trove_classifiers import classifiers as official
+
+        unknown = [item for item in _pyproject()["project"]["classifiers"]
+                   if item not in official]
+        self.assertEqual(unknown, [], f"PyPI 会拒绝这些分类器：{unknown}")
 
     def test_console_script_points_at_the_cli(self):
         scripts = _pyproject()["project"]["scripts"]

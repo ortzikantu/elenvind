@@ -33,7 +33,6 @@ keywords = [
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Web Environment",
-    "Framework :: WSGI",
     "Intended Audience :: End Users/Desktop",
     "Natural Language :: Chinese (Simplified)",
     "Natural Language :: English",
@@ -62,7 +61,7 @@ gunicorn = ["gunicorn>=23"]
 waitress = ["waitress>=3.0"]
 uwsgi = ["uWSGI>=2.0.28"]
 hypercorn = ["hypercorn>=0.17"]
-dev = ["ruff>=0.9"]
+dev = ["ruff>=0.9", "trove-classifiers"]
 
 [project.urls]
 Homepage = "https://codeberg.org/ortzikantu/elenvind"
