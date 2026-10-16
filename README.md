@@ -5,11 +5,12 @@
 ```bash
 pip install "elenvind[gunicorn]"
 elenvind init --dir /srv/elenvind --domain example.com
-elenvind serve                 # 自动检测并选择 WSGI 服务器
-elenvind proxy configure --domain example.com --apply   # 443 + 80→443
+elenvind serve                 # 自动检测并选择 WSGI 服务器（只监听回环）
+elenvind doctor                # 体检：实例根、配置、数据库、可用的服务器与反向代理
 ```
 
-命令行的完整用法见 [`manual/CLI.md`](manual/CLI.md)。
+对外服务（反向代理 + TLS 证书）按 [`manual/HOSTING.md`](manual/HOSTING.md) 手写：
+**本命令行不修改任何系统配置**。完整用法见 [`manual/CLI.md`](manual/CLI.md)。
 
 ## 边界（先读这一节）
 
@@ -90,7 +91,7 @@ cd /srv/elenvind
 $EDITOR config.toml                                          # 至少改 admin_user_id 与 [static]
 /srv/elenvind/.venv/bin/elenvind doctor                      # 体检：缺什么会直说
 /srv/elenvind/.venv/bin/elenvind serve                       # 自动选服务器并启动
-sudo /srv/elenvind/.venv/bin/elenvind proxy configure --domain example.com --apply
+# 对外服务（反向代理 + TLS 证书）按 manual/HOSTING.md 手写；本工具不修改系统配置
 ```
 
 ### 仓库与发布

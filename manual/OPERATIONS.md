@@ -20,9 +20,7 @@ sudo chown -R root:elenvind /srv/elenvind
 sudo chmod 750 /srv/elenvind && sudo chmod 640 /srv/elenvind/config.toml
 sudo install -d -o elenvind -g elenvind -m 750 /srv/elenvind/{data,logs,backups}
 
-# 单元文件随包分发，`--with-unit` 会自动装好它（推荐）
-sudo /srv/elenvind/.venv/bin/elenvind proxy configure --domain <域名> --apply --with-unit
-# 或者手工复制：包内路径是 <venv>/lib/python3.*/site-packages/elenvind/resources/elenvind.service
+# 单元文件随包分发（包内路径 <venv>/lib/python3.*/site-packages/elenvind/resources/elenvind.service）
 sudo cp "$(dirname "$(readlink -f /srv/elenvind/.venv/bin/elenvind)")/../elenvind/resources/elenvind.service" /etc/systemd/system/
 sudo cp manual/logrotate.conf /etc/logrotate.d/elenvind
 sudo systemctl daemon-reload && sudo systemctl enable --now elenvind

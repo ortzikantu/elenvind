@@ -1,22 +1,22 @@
 """CLI 的守卫：子命令可用、危险操作必须显式许可、交互可以被关掉。
 
-CLI 是本项目最容易"看起来能用、实际踩坑"的一块：它写系统配置、启动服务、
-还会在没人回答的时候等输入。所以这里把每条分支都钉住，尤其是
-"默认只输出、`--apply` 才落地"和"`--yes` 绝不提问"这两条。
+CLI 是本项目最容易"看起来能用、实际踩坑"的一块：它启动服务、还会在没人回答的时候
+等输入。所以这里把每条分支都钉住：`--yes` 绝不提问、缺配置时给出可执行的下一步、
+以及"命令行不提供修改系统配置的能力"这条边界。
 """
 from __future__ import annotations
 
 import contextlib
 import io
-import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from tests import support
+from tests.support import PROJECT_ROOT
 
-SUBMODULES = ("init", "serve", "backup", "doctor", "proxy")
+SUBMODULES = ("init", "serve", "backup", "doctor")
 
 
 def _run(argv):
@@ -257,136 +257,40 @@ class LauncherWiring(unittest.TestCase):
         self.assertEqual(launcher._forwarded_allow_ips({"trusted_proxies": []}), "")
 
 
-class ProxyConfiguration(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        support.ensure_application()
+class NoProxyConfigurationFeature(unittest.TestCase):
+    """反代与证书的配置由管理员按手册手写：命令行不提供改动它的能力。"""
 
-    def setUp(self):
-        from elenvind import cli, reverse_proxy
-
-        self.cli, self.rp = cli, reverse_proxy
-        self.config = support.test_config(support.WORKSPACE)
-        self.tls = Path(tempfile.mkdtemp(prefix="elenvind-cli-tls-"))
-        (self.tls / "cert.pem").write_text("dummy cert\n", encoding="utf-8")
-        (self.tls / "key.pem").write_text("dummy key\n", encoding="utf-8")
-        self.patch = mock.patch.object(cli, "_load_config", lambda: self.config)
-        self.patch.start()
-        self.addCleanup(self.patch.stop)
-        self.addCleanup(self._cleanup)
-        self.target = self.tls / "out" / "site.conf"
-
-    def _cleanup(self):
-        for item in sorted(self.tls.rglob("*"), reverse=True):
-            item.unlink() if item.is_file() else item.rmdir()
-        self.tls.rmdir()
-
-    def _configure(self, *extra, target=None):
-        target = self.target if target is None else target
-        with mock.patch.object(self.rp.ReverseProxy, "target",
-                              lambda proxy, domain: target):
-            return _run(["proxy", "configure", "--proxy", "nginx", "--domain",
-                         "example.test", "--cert", str(self.tls / "cert.pem"),
-                         "--key", str(self.tls / "key.pem"), *extra])
-
-    def test_detect_needs_no_config(self):
-        code, output = _run(["proxy", "detect"])
+    def test_cli_exposes_no_proxy_subcommand(self):
+        code, output = _run(["--help"])
         self.assertEqual(code, 0)
-        self.assertTrue("nginx" in output or "没有检测到" in output)
+        for name in SUBMODULES:
+            self.assertIn(name, output)
+        self.assertNotIn("proxy", output)
+        for argv in (["proxy"], ["proxy", "configure"], ["proxy", "detect"]):
+            self.assertEqual(_run(argv)[0], 2, argv)      # 未知子命令 = 用法错误
 
-    def test_configure_refuses_a_missing_certificate(self):
-        code, output = _run(["proxy", "configure", "--proxy", "nginx", "--domain",
-                             "example.test", "--cert", str(self.tls / "nope.pem"),
-                             "--key", str(self.tls / "key.pem")])
-        self.assertEqual(code, 1)
-        self.assertIn("不存在", output)
-
-    def test_configure_needs_a_domain(self):
-        broken = dict(self.config, site_url="")
-        with mock.patch.object(self.cli, "_load_config", lambda: broken):
-            code, output = _run(["proxy", "configure", "--proxy", "nginx"])
-        self.assertEqual(code, 2)
-        self.assertIn("域名", output)
-
-    def test_dry_run_renders_but_writes_nothing(self):
-        code, output = self._configure()
-        self.assertEqual(code, 0, output)
-        self.assertFalse(self.target.exists(), "dry-run 不得写任何文件")
-        self.assertIn("return 301 https://$host$request_uri", output)
-        self.assertIn("proxy_pass http://127.0.0.1:", output)
-        self.assertIn("ssl_certificate", output)
-        self.assertIn("client_max_body_size", output)
-        self.assertIn(str(self.tls / "cert.pem"), output)
-
-    def test_proxy_body_limit_exceeds_the_application_limit(self):
-        """代理的上限必须更大，否则应用自己的 413 在代理后面永远看不到。"""
-        _code, output = self._configure()
-        match = re.search(r"client_max_body_size\s+(\d+)([km]?)", output)
-        self.assertIsNotNone(match, "生成的配置里应有 client_max_body_size")
-        amount, unit = int(match.group(1)), match.group(2)
-        limit = amount * {"": 1, "k": 1024, "m": 1024 * 1024}[unit]
-        self.assertGreater(limit, int(self.config["max_body_size"]))
-
-    def test_proxy_read_timeout_exceeds_the_worker_timeout(self):
+    def test_reverse_proxy_module_is_read_only(self):
+        """该模块只做探测：任何写盘 / 渲染 / 证书检索入口都不该再存在。"""
         from elenvind import reverse_proxy
 
-        read_timeout = reverse_proxy.read_source_timeout({"timeout": 30})
-        self.assertGreater(read_timeout, 30)
-        self.assertIn(f"proxy_read_timeout    {read_timeout}s", self._configure()[1])
+        for forbidden in ("apply", "plan", "Write", "Plan", "managed_block",
+                          "replace_managed_block", "existing_domain_files", "is_ours",
+                          "search_certificates", "find_certificate",
+                          "certificate_candidates", "verify_and_reload", "run",
+                          "Render", "Certificate", "ProxyError", "choose", "find"):
+            self.assertFalse(hasattr(reverse_proxy, forbidden),
+                             f"{forbidden} 不该再存在（配置由管理员手写）")
+        self.assertTrue(hasattr(reverse_proxy, "detect"))
 
-    def test_apply_requires_root(self):
-        with mock.patch("os.geteuid", lambda: 1000):
-            code, output = self._configure("--apply")
-        self.assertEqual(code, 1)
-        self.assertIn("root", output)
-        self.assertFalse(self.target.exists())
+    def test_manual_documents_every_supported_proxy(self):
+        """文档是唯一权威：每种代理的写法与证书获取办法都要能在手册里找到。"""
+        from elenvind import reverse_proxy
 
-    def test_apply_writes_and_then_reloads(self):
-        with mock.patch("os.geteuid", lambda: 0), \
-             mock.patch.object(self.rp, "verify_and_reload", return_value=True) as reloaded:
-            code, output = self._configure("--apply")
-        self.assertEqual(code, 0, output)
-        self.assertTrue(self.target.is_file())
-        self.assertIn("example.test", self.target.read_text(encoding="utf-8"))
-        self.assertEqual(reloaded.call_count, 1)
-
-    def test_apply_reports_a_failed_reload(self):
-        with mock.patch("os.geteuid", lambda: 0), \
-             mock.patch.object(self.rp, "verify_and_reload", return_value=False):
-            code, _output = self._configure("--apply")
-        self.assertEqual(code, 1)
-        self.assertTrue(self.target.is_file(), "写入成功但 reload 失败：文件应保留现场")
-
-    def test_certificate_lookup_prefers_explicit_paths(self):
-        certificate = self.rp.find_certificate("example.test",
-                                               str(self.tls / "cert.pem"),
-                                               str(self.tls / "key.pem"))
-        self.assertEqual(certificate.cert, self.tls / "cert.pem")
-        self.assertEqual(certificate.key, self.tls / "key.pem")
-
-    def test_certificate_lookup_never_invents_a_certificate(self):
-        with self.assertRaises(self.rp.ProxyError):
-            self.rp.find_certificate("no-such-domain.invalid")
-
-    def test_every_proxy_renders_a_complete_configuration(self):
-        """四个代理的模板都必须含 443、80 跳转、证书与上游。"""
-        certificate = self.rp.Certificate(self.tls / "cert.pem", self.tls / "key.pem")
-        spec = self.rp.Render(domain="example.test", upstream="127.0.0.1:6789",
-                              certificate=certificate)
-        markers = {
-            # 不带分号：`listen 443 ssl;` 与 `listen 443 ssl http2;` 都要能匹配
-            "nginx": ("listen 80;", "listen 443 ssl"),
-            "caddy": ("reverse_proxy", "tls "),
-            "apache": ("<VirtualHost *:80>", "<VirtualHost *:443>"),
-            "haproxy": ("bind :80", "bind :443 ssl"),
-        }
-        for proxy in self.rp.PROXIES:
-            text = proxy.render(spec)
-            self.assertIn("example.test", text, proxy.name)
-            self.assertIn("127.0.0.1:6789", text, proxy.name)
-            self.assertIn(str(self.tls / "cert.pem"), text, proxy.name)
-            for marker in markers[proxy.name]:
-                self.assertIn(marker, text, f"{proxy.name}: {marker}")
+        text = (PROJECT_ROOT / "manual" / "HOSTING.md").read_text(encoding="utf-8")
+        for proxy in reverse_proxy.PROXIES:
+            self.assertIn(proxy.name, text.lower(), f"手册缺少 {proxy.name} 的写法")
+        for topic in ("certbot", "acme.sh", "systemctl reload", "client_max_body_size"):
+            self.assertIn(topic, text, f"手册缺少 {topic}")
 
 
 class LegacyRunner(unittest.TestCase):

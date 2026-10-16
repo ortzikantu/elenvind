@@ -21,11 +21,10 @@ elenvind init --dir /srv/elenvind --domain example.com   # 1. 建站骨架
 $EDITOR /srv/elenvind/config.toml                        # 2. 至少改 admin_user_id 与 [static]
 cd /srv/elenvind && elenvind doctor                      # 3. 体检：缺什么它会直说
 elenvind serve                                           # 4. 启动（自动选服务器）
-sudo elenvind proxy configure --domain example.com --apply   # 5. 443 + 80→443 + reload
 ```
 
-第 5 步默认是 **dry-run**：只打印将要写入的配置；`--apply` 才写文件并 reload 反代。
-`--with-unit` 会顺便把 systemd 单元装好。
+第 5 步（对外服务）不在命令行里：反向代理与 TLS 证书按 [`HOSTING.md`](HOSTING.md) 手写，
+写完自己 `nginx -t` 校验并 reload。**本工具不修改任何系统配置。**
 
 ## 站点实例根目录
 
@@ -122,50 +121,27 @@ waitress-serve --listen=127.0.0.1:6789 elenvind.wsgi:application
 检测到的反向代理，并检查两个最容易配错的东西 —— `[server].host` 是不是回环地址、
 `site_url` 是不是 `https://…`。发现问题返回退出码 1。
 
-### `elenvind proxy detect`
+## 反向代理与证书：不在本工具的职责内
 
-列出检测到的反向代理、它们的配置目录（是否存在）、以及各自适合什么场景。
+本命令行**不修改任何系统配置**。反向代理的站点配置、TLS 证书的申请与续期都由你
+（或你的配置管理工具）完成，写法与注意事项见 [`HOSTING.md`](HOSTING.md)：
 
-### `elenvind proxy configure`
+- nginx / Caddy / Apache / HAProxy 四种最小可用配置（转发 + 80→443 + 连接超时）；
+- 证书获取（certbot / acme.sh / 自签仅供测试）、私钥权限、续期之后如何重载代理；
+- 三件**必须由代理承担**的事：连接级慢连接、http→https 跳转、请求体上限不小于应用的
+  `max_body_size`。
 
-生成"443 转发到应用 + 80 永久跳转 + 连接级超时"的配置。**默认只打印**
-（dry-run，不改任何文件），`--apply` 才写入系统路径并 reload。
-
-| 选项 | 说明 |
-|---|---|
-| `--proxy NAME` | `nginx` / `caddy` / `apache` / `haproxy`（只有一个被检测到时自动选） |
-| `--domain DOMAIN` | 站点域名，默认从 `site_url` 取 |
-| `--cert PATH` `--key PATH` | 证书与私钥；不写则在 `/etc/letsencrypt/live/<域名>/` 里找 |
-| `--apply` | 写入并 reload（需要 root） |
-| `--with-unit` | 顺便安装并启用 systemd 单元（需要 root） |
-| `--body-limit SIZE` | 代理侧请求体上限，默认 = 应用的 `max_body_size` + 1 KiB |
-| `-y, --yes` | 不提问 |
-
-**证书必须已经存在**：找不到就明确报错并给出 `certbot` 示例，**不会**替你生成自签证书
-（一个指向不存在证书的 443 配置只会让代理启动失败或握手报错）。
-
-各代理的落点与后续动作：
-
-| 代理 | 写入 | 之后自动做 | 还需你做一次 |
-|---|---|---|---|
-| nginx | `/etc/nginx/conf.d/elenvind-<域名>.conf` | `nginx -t` → `systemctl reload nginx` | — |
-| Caddy | `/etc/caddy/Caddyfile.d/<域名>.caddy` | `caddy validate` → `systemctl reload caddy` | Caddyfile 顶部加 `import Caddyfile.d/*` |
-| Apache | `/etc/apache2/sites-available/elenvind-<域名>.conf` | `apachectl configtest` → reload | `a2enmod` / `a2ensite`（Debian 系） |
-| HAProxy | `/etc/haproxy/conf.d/elenvind-<域名>.cfg` | `haproxy -c` → `systemctl reload haproxy` | 主配置加 `include /etc/haproxy/conf.d/*.cfg` |
-
-写入采用"先写临时文件再 rename"，`--apply` 时若配置校验或 reload 失败，**已经写入的文件
-会保留现场**（不会半途删掉），便于你对照报错修正。
-
-生成的内容只有转发、跳转与超时 —— 限流、CSRF、安全响应头这些都由应用自己提供，
-代理不需要知道任何业务语义（见 [`HOSTING.md`](HOSTING.md)）。
+`elenvind doctor` 只做只读体检：它会告诉你这台机器上装了哪个反代、配置通常放在哪个
+目录，并检查 `[server].host` 是否回环、`site_url` 是否 `https://…`。它不会写文件、
+不 reload 服务。
 
 ## 退出码
 
 | 码 | 含义 |
 |---|---|
 | 0 | 成功 |
-| 1 | 环境或配置问题（缺配置、证书找不到、服务器不可用、reload 失败、体检未通过） |
-| 2 | 用法错误（未知子命令或选项、缺参数、`proxy configure` 既没给 `--domain` 也无法从 `site_url` 推出域名） |
+| 1 | 环境或配置问题（缺配置文件、没有可用的 WSGI 服务器、目录不可写、体检未通过） |
+| 2 | 用法错误（未知子命令或选项、缺参数、参数取值不合法） |
 | 130 | 被 Ctrl-C 中断 |
 
 ## 与 `python run.py` 的关系
@@ -188,7 +164,5 @@ waitress-serve --listen=127.0.0.1:6789 elenvind.wsgi:application
 |---|---|
 | `没有检测到任何 WSGI 服务器` | `pip install elenvind[gunicorn]`（或 `[waitress]` 等） |
 | `没有找到配置文件` | 在站点目录里运行，或设 `ELENVIND_ROOT=/srv/elenvind`，或先 `elenvind init` |
-| `没有找到 <域名> 的证书` | 先签发（`certbot certonly`），或用 `--cert/--key` 指定 |
-| `--apply 需要 root` | 用 `sudo`；dry-run 不需要 |
-| 反代 reload 失败 | 文件已写入并保留；按输出里的 `nginx -t` 报错修正后 `systemctl reload` |
+| 反代不生效 / 证书报错 | 这不是本工具管的：按 [`HOSTING.md`](HOSTING.md) 检查配置，`nginx -t` 校验后 `systemctl reload` |
 | 端口被占用 | `elenvind doctor` 会指出监听地址；换端口或停掉占用者 |

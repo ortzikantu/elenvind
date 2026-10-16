@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -18,6 +19,18 @@ from tests.support import ARTICLE_SLUG, PROJECT_ROOT
 #: 全部 systemd 单元示例：守卫覆盖每一个（新增单元自动纳入）
 SERVICE_FILES = sorted(PROJECT_ROOT.glob("manual/*.service"))
 NGINX_EXAMPLE = PROJECT_ROOT / "manual" / "nginx.conf.example"
+
+
+def _nginx_version():
+    """本机 nginx 的版本元组；拿不到返回 None。
+
+    `http2 on;` 是 1.25.1 起才有的指令；示例给的是现代写法，因此在旧版本上要先按注释
+    里的替代写法替换那一行，再把其余指令原样交给 `nginx -t` 校验。
+    """
+    result = subprocess.run(["nginx", "-v"], capture_output=True, text=True, check=False)
+    match = re.search(r"nginx/(\d+)\.(\d+)(?:\.(\d+))?",
+                      (result.stderr or "") + (result.stdout or ""))
+    return tuple(int(part) for part in match.groups(default="0")) if match else None
 
 
 class DatabasePathAPI(unittest.TestCase):
@@ -466,58 +479,6 @@ class DeploymentFiles(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("nginx") and shutil.which("openssl"),
                          "nginx/openssl are unavailable")
-    def test_both_http2_spellings_parse(self):
-        """两种 HTTP/2 写法都必须被本机 nginx 接受。
-
-        新写法（`http2 on;`）只在 >= 1.25.1 可用；旧写法（`listen ... http2`）在新版本上
-        只是被标记为弃用但仍然合法。两者都渲染一遍交给 `nginx -t`，这样即使 CI 用的是
-        新 nginx，旧写法也仍然被真实校验证过。
-        """
-        import subprocess
-        import tempfile
-        from pathlib import Path
-
-        from elenvind import reverse_proxy
-
-        if not shutil.which("nginx") or not shutil.which("openssl"):
-            self.skipTest("需要 nginx 与 openssl")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp)
-            certificate, key = workspace / "cert.pem", workspace / "key.pem"
-            generated = subprocess.run(
-                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-                 "-keyout", str(key), "-out", str(certificate), "-days", "1",
-                 "-subj", "/CN=example.test"],
-                capture_output=True, text=True, check=False)
-            if generated.returncode != 0:
-                self.skipTest(f"openssl unavailable: {generated.stderr}")
-
-            proxy = reverse_proxy.find("nginx")
-            for label, block in (("modern", reverse_proxy.HTTP2_MODERN),
-                                 ("legacy", reverse_proxy.HTTP2_LEGACY)):
-                spec = reverse_proxy.Render(
-                    domain="example.test", upstream="127.0.0.1:6789",
-                    certificate=reverse_proxy.Certificate(certificate, key),
-                    http2=block)
-                (workspace / "site.conf").write_text(proxy.render(spec), encoding="utf-8")
-                (workspace / "nginx.conf").write_text(
-                    "worker_processes 1;\n"
-                    f"error_log {workspace / 'error.log'};\n"
-                    f"pid {workspace / 'nginx.pid'};\n"
-                    "events { worker_connections 64; }\n"
-                    "http {\n  access_log off;\n"
-                    f"  include {workspace / 'site.conf'};\n}}\n", encoding="utf-8")
-                result = subprocess.run(
-                    ["nginx", "-t", "-c", str(workspace / "nginx.conf"), "-p", str(workspace)],
-                    capture_output=True, text=True, check=False)
-                output = (result.stdout or "") + (result.stderr or "")
-                if label == "modern" and not reverse_proxy.nginx_supports_http2_directive():
-                    self.assertNotIn("syntax is ok", output,
-                                     "旧 nginx 不该接受 `http2 on;`——那正是要按版本分支的原因")
-                    continue
-                self.assertIn("syntax is ok", output, f"{label}: {output}")
-
     def test_nginx_example_parses(self):
         """示例必须能被 nginx 接受（HTTP/2 一行按本机版本替换后再校验）。
 
@@ -525,16 +486,16 @@ class DeploymentFiles(unittest.TestCase):
         示例给的是现代写法，因此这里先把那一行换成当前 nginx 支持的写法，其余指令
         （limit_req_zone / limit_conn_zone / proxy_* / ssl_*）全部原样交给 `nginx -t`。
         """
-        from elenvind import reverse_proxy
-
         example = NGINX_EXAMPLE.read_text(encoding="utf-8")
-        if not reverse_proxy.nginx_supports_http2_directive():
-            http2_block, _note = reverse_proxy.nginx_http2_block()
+        version = _nginx_version()
+        if version and version < (1, 25, 1):
             for modern in ("    listen 443 ssl;\n    listen [::]:443 ssl;\n    http2 on;",
                            "    listen 443 ssl;\n    listen [::]:443 ssl;\n"
-                           "    # nginx >= 1.25.1 的写法；旧版本请改用 "
-                           "`listen 443 ssl http2;` 并删掉这一行\n    http2 on;"):
-                example = example.replace(modern, http2_block)
+                           "    # HTTP/2：nginx >= 1.25.1 用 `http2 on;`；更早的版本"
+                           "（如 Ubuntu 24.04 自带的\n    # 1.24）不认识它，改用 "
+                           "`listen 443 ssl http2;` 并删掉这一行。\n    http2 on;"):
+                example = example.replace(
+                    modern, "    listen 443 ssl http2;\n    listen [::]:443 ssl http2;")
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             certificate = workspace / "cert.pem"

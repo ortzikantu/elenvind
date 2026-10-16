@@ -3,12 +3,14 @@
     elenvind init      生成站点实例（配置 + 内容目录 + 运行期目录）
     elenvind serve     自动检测并选择 WSGI 服务器，把站点拉起来
     elenvind backup    在线备份数据库
-    elenvind doctor    环境体检：实例根、配置、数据库、服务器、反代、证书
-    elenvind proxy     探测反向代理并生成/写入它的站点配置
+    elenvind doctor    环境体检：实例根、配置、数据库、WSGI 服务器、反向代理
 
 所有子命令都读同一份 `config.toml`（位置由实例根决定：`ELENVIND_ROOT` →
-从当前目录向上找 `config.toml` → 当前目录）。危险操作（写系统路径、reload 服务）
-一律要求显式 `--apply`；交互式提问可以被 `--yes` 关掉，便于脚本与非交互环境。
+从当前目录向上找 `config.toml` → 当前目录）。交互式提问可以用 `--yes` 关掉，
+便于脚本与非交互环境。
+
+本命令行**不修改任何系统配置**：反向代理与 TLS 证书的配置由管理员按
+`manual/HOSTING.md` 手写，这里最多只做只读探测与体检。
 """
 from __future__ import annotations
 
@@ -17,7 +19,6 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 from . import launcher, reverse_proxy, scaffold
 from .core.console import banner, error, info, success, warning
@@ -26,10 +27,6 @@ from .core.version import get_version
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
-
-#: 上游地址里不能出现通配地址：代理要连的是"本机某端口"
-_WILDCARD_HOSTS = {"0.0.0.0", "::", "[::]", "*", ""}
-
 
 def main(argv=None) -> int:
     """CLI 入口；返回进程退出码。"""
@@ -55,8 +52,8 @@ def _parser() -> argparse.ArgumentParser:
         prog="elenvind",
         description="Elenvind —— 安全默认的个人网站服务器"
                     "（标准库 + WSGI + SQLite + Jinja2，SSR + Zero-JS）",
-        epilog="站点只监听回环地址，对外服务由反向代理提供："
-               "`elenvind proxy configure --domain <域名> --apply`。",
+        epilog="站点只监听回环地址，对外服务由反向代理提供；"
+               "反代与 TLS 证书的配置按 manual/HOSTING.md 手写。",
     )
     parser.add_argument("--version", action="version",
                         version=f"elenvind {get_version()}")
@@ -93,33 +90,6 @@ def _parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="环境体检")
     doctor.set_defaults(handler=_cmd_doctor)
 
-    proxy = commands.add_parser("proxy", help="探测反向代理并生成/写入站点配置")
-    proxy_commands = proxy.add_subparsers(dest="proxy_command", metavar="<动作>")
-    detect = proxy_commands.add_parser("detect", help="列出检测到的反向代理")
-    detect.add_argument("--domain", metavar="DOMAIN",
-                        help="同时按域名报告：已有配置在哪个文件、是不是 elenvind 写的")
-    detect.set_defaults(handler=_cmd_proxy_detect)
-    certs = proxy_commands.add_parser("certs", help="按域名检索证书位置")
-    certs.add_argument("--domain", metavar="DOMAIN", help="站点域名（默认取自 site_url）")
-    certs.set_defaults(handler=_cmd_proxy_certs)
-    configure = proxy_commands.add_parser(
-        "configure",
-        help="生成 443 + 80→443 配置（先按域名检索；只新增或就地更新受管段落，"
-             "绝不覆盖别人的配置）")
-    configure.add_argument("--proxy", metavar="NAME",
-                           help="指定反向代理（" +
-                                "/".join(item.name for item in reverse_proxy.PROXIES) + "）")
-    configure.add_argument("--domain", metavar="DOMAIN", help="站点域名（默认取自 site_url）")
-    configure.add_argument("--cert", metavar="PATH", help="证书链文件（默认找 Let's Encrypt）")
-    configure.add_argument("--key", metavar="PATH", help="私钥文件")
-    configure.add_argument("--apply", action="store_true",
-                           help="写入并 reload（需要 root；改动已有文件前先留 .bak）")
-    configure.add_argument("--with-unit", action="store_true",
-                           help="同时安装 systemd 单元（需要 root）")
-    configure.add_argument("--body-limit", metavar="SIZE", default=None,
-                           help="代理侧请求体上限（默认 = 应用的 max_body_size）")
-    configure.add_argument("-y", "--yes", action="store_true", help="不提问：全部采用默认值")
-    configure.set_defaults(handler=_cmd_proxy_configure)
     return parser
 
 
@@ -168,20 +138,6 @@ def _banner() -> None:
     banner("=================================")
 
 
-def _site_domain(config) -> str:
-    """从 `site_url` 取域名；取不到就返回空串。"""
-    return urlparse(str(config.get("site_url", "") or "")).hostname or ""
-
-
-def _upstream(server_config) -> str:
-    """代理要连的上游地址：通配监听一律收敛成回环地址。"""
-    host = str(server_config.get("host", "127.0.0.1") or "").strip()
-    port = int(server_config.get("port", 6789) or 6789)
-    if host in _WILDCARD_HOSTS:
-        host = "127.0.0.1"
-    return f"{host}:{port}"
-
-
 # ---------------------------------------------------------------- 子命令
 
 
@@ -198,7 +154,7 @@ def _cmd_init(args) -> int:
     info(f"  1) 编辑 {_relative(target / 'config.toml', target)}"
          "（site_url / admin_user_id / [static] 的资源地址）")
     info("  2) elenvind serve")
-    info("  3) elenvind proxy configure --domain <域名> --apply")
+    info("  3) 按 manual/HOSTING.md 配好反向代理与证书（本工具不修改系统配置）")
     return EXIT_OK
 
 
@@ -294,7 +250,8 @@ def _cmd_doctor(args) -> int:
         warning("  一个都没有。站点的对外服务需要一个反向代理"
                 "（nginx / caddy / apache2 / haproxy 任选其一）。")
     for proxy in found:
-        info(f"  ✓ {proxy.title}；配置会写到 {proxy.targets[0]}")
+        info(f"  ✓ {proxy.title}：{proxy.when}")
+        info(f"     配置：{proxy.config_hint}（写法见 manual/HOSTING.md）")
 
     print()
     if problems:
@@ -354,185 +311,5 @@ def _report_instance(root: Path, config, problems: list[str]) -> None:
                 "仅当代理是 TCP 转发器或没有代理时才应该这样。")
 
 
-def _cmd_proxy_detect(args) -> int:
-    found = reverse_proxy.detect()
-    if not found:
-        warning("没有检测到反向代理。装一个即可（nginx / caddy / apache2 / haproxy）。")
-        return EXIT_OK
-    domain = str(getattr(args, "domain", "") or "").strip()
-    info("检测到以下反向代理：")
-    for proxy in found:
-        target = proxy.targets[0]
-        marker = "存在" if target.is_dir() else "不存在"
-        info(f"  {proxy.title}：配置目录 {target}（{marker}）")
-        info(f"     {proxy.when}")
-        if domain:
-            _report_domain_files(proxy, domain)
-    return EXIT_OK
-
-
-def _report_domain_files(proxy, domain: str) -> None:
-    """按域名报告已有配置：这是"新增还是就地更新"的唯一依据。"""
-    hits = reverse_proxy.existing_domain_files(proxy, domain)
-    if not hits:
-        info(f"     {domain}：暂无配置 -> 会新增")
-        return
-    for path in hits:
-        if reverse_proxy.is_ours(path, domain):
-            info(f"     {domain}：{path} —— elenvind 受管段落，会**就地更新**这一段")
-        else:
-            warning(f"     {domain}：{path} —— 不是 elenvind 写的，configure 会拒绝改动")
-
-
-def _cmd_proxy_certs(args) -> int:
-    config = _load_config()
-    if config is None:
-        return EXIT_FAILED
-    domain = (args.domain or _site_domain(config)).strip()
-    if not domain:
-        error("无法确定域名：用 --domain 指定，或把 config.toml 的 site_url 写成真实地址")
-        return EXIT_USAGE
-    from .core.config import ROOT
-
-    info(f"按域名检索证书：{domain}（同时尝试 www 与裸域名的互换）")
-    found = reverse_proxy.search_certificates(domain, ROOT)
-    if found:
-        for item in found:
-            success(f"  找到：{item.cert} + {item.key}（来源：{item.source}）")
-        info("configure 会使用列表里的第一个；也可用 --cert/--key 显式指定。")
-        return EXIT_OK
-    try:
-        reverse_proxy.find_certificate(domain, instance_root=ROOT)
-    except reverse_proxy.ProxyError as problem:
-        error(str(problem))
-    return EXIT_FAILED
-
-
-def _cmd_proxy_configure(args) -> int:
-    config = _load_config()
-    if config is None:
-        return EXIT_FAILED
-    server_config = config.get("server", {}) or {}
-
-    domain = (args.domain or _site_domain(config)).strip()
-    if not domain:
-        error("无法确定域名：用 --domain 指定，或把 config.toml 的 site_url 写成真实地址")
-        return EXIT_USAGE
-
-    proxy, reason = reverse_proxy.choose(args.proxy, interactive=not args.yes)
-    if proxy is None:
-        error(reason)
-        return EXIT_FAILED
-
-    from .core.config import ROOT
-
-    try:
-        certificate = reverse_proxy.find_certificate(domain, args.cert, args.key, ROOT)
-    except reverse_proxy.ProxyError as problem:
-        error(str(problem))
-        return EXIT_FAILED
-
-    http2_block, http2_note = reverse_proxy.nginx_http2_block()
-    spec = reverse_proxy.Render(
-        domain=domain,
-        upstream=_upstream(server_config),
-        certificate=certificate,
-        body_limit=args.body_limit or _body_limit(config),
-        body_limit_bytes=_body_limit_bytes(config),
-        read_timeout=reverse_proxy.read_source_timeout(server_config),
-        http2=http2_block,
-    )
-    plan_ = reverse_proxy.plan(proxy, spec)
-
-    print()
-    info(f"反向代理：{proxy.title}（{reason}）")
-    info(f"站点：{domain} -> http://{spec.upstream}")
-    info(f"证书：{certificate.cert}（来源：{certificate.source}）")
-    if proxy.name == "nginx":
-        info(f"HTTP/2：{http2_note}")
-
-    if plan_.blocked:
-        error(plan_.message)
-        return EXIT_FAILED
-
-    info(f"动作：{plan_.action}")
-    for detail in plan_.details:
-        info(f"  - {detail}")
-    print()
-    for item in plan_.writes:
-        print(f"----- {item.path} -----")
-        print(item.text)
-
-    if not args.apply:
-        info("（dry-run，未改动任何文件）应用改动：sudo elenvind proxy configure "
-             f"--proxy {proxy.name} --domain {domain} --apply")
-        return EXIT_OK
-
-    if os.geteuid() != 0:
-        error("--apply 需要 root：请用 sudo 重新执行")
-        return EXIT_FAILED
-    try:
-        written = reverse_proxy.apply(plan_)
-    except reverse_proxy.ProxyError as problem:
-        error(str(problem))
-        return EXIT_FAILED
-    for path in written:
-        success(f"已写入 {path}（改动前的内容留在同名 .bak）")
-    if proxy.extra_step:
-        info(f"提示：{proxy.extra_step}")
-    if not reverse_proxy.verify_and_reload(proxy):
-        return EXIT_FAILED
-    if args.with_unit:
-        return _install_unit()
-    return EXIT_OK
-
-
 if __name__ == "__main__":                     # pragma: no cover - 手工入口
     raise SystemExit(main())
-
-
-def _body_limit(config) -> str:
-    """把应用的字节上限折算成代理配置里好读的形式（如 `2m`）。"""
-    size = _body_limit_bytes(config)
-    if size % (1024 * 1024) == 0:
-        return f"{size // (1024 * 1024)}m"
-    if size % 1024 == 0:
-        return f"{size // 1024}k"
-    return str(size)
-
-
-def _body_limit_bytes(config) -> int:
-    """代理侧请求体上限：比应用上限**大一点**，否则应用自己的 413 永远看不到。"""
-    try:
-        limit = int(config.get("max_body_size", 0) or 0)
-    except (TypeError, ValueError):
-        limit = 0
-    return max(limit, 1024) + 1024
-
-
-def _install_unit() -> int:
-    """把包内的 systemd 单元装到系统上（需要 root）。"""
-    import shutil
-
-    source = scaffold.RESOURCES / "elenvind.service"
-    target = Path("/etc/systemd/system/elenvind.service")
-    if not source.is_file():
-        error(f"包内缺少单元文件：{source}")
-        return EXIT_FAILED
-    if target.exists():
-        warning(f"{target} 已存在，未覆盖；如需更新请手动对比 {source}")
-    else:
-        try:
-            shutil.copyfile(source, target)
-        except OSError as problem:
-            error(f"无法写入 {target}：{problem}")
-            return EXIT_FAILED
-        success(f"已安装 {target}")
-    for command in (("systemctl", "daemon-reload"),
-                    ("systemctl", "enable", "--now", "elenvind")):
-        ok, output = reverse_proxy.run(command)
-        if not ok:
-            error(f"{' '.join(command)} 失败：{output}")
-            return EXIT_FAILED
-    success("elenvind.service 已启用并启动")
-    return EXIT_OK

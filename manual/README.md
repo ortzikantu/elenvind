@@ -10,7 +10,7 @@ README 只保留项目概览与边界。
 | 让站点对外可用（TLS、反向代理、换反代） | [HOSTING.md](HOSTING.md) |
 | 改配置项、搞清每个键的语义与默认值 | [CONFIGURATION.md](CONFIGURATION.md) |
 | 装 systemd、轮转日志、备份恢复、升级回滚、排障 | [OPERATIONS.md](OPERATIONS.md) |
-| 用命令行：建站 / 启动 / 备份 / 体检 / 生成反代配置 | [CLI.md](CLI.md) |
+| 用命令行：建站 / 启动 / 备份 / 体检 | [CLI.md](CLI.md) |
 | 发一个新版本（改版本号、打 tag、PyPI 发布流水线） | [RELEASE.md](RELEASE.md) |
 | 看安全模型、信任边界、各反代的差异与已知限制 | [SECURITY.md](SECURITY.md) |
 

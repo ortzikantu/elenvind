@@ -55,6 +55,56 @@
    默认只有 `1m`。实测：把应用上限调大而忘记调代理上限时，超限请求会被 nginx 抢答 413，
    **应用侧日志里什么都看不到**，可观测性静默丢失。
 
+## 证书（TLS）
+
+本服务不生成、不存储、不轮换证书：证书由你准备好，交给反向代理使用。
+
+获取（三选一，域名换成你自己的）：
+
+```bash
+# 1) Let's Encrypt + certbot（推荐）：自动签发、自动续期
+sudo apt-get install -y certbot
+sudo certbot certonly --standalone -d example.com      # 需 80 端口空闲；也可 --nginx / --webroot
+# 产物：/etc/letsencrypt/live/example.com/{fullchain.pem,privkey.pem}
+
+# 2) acme.sh：不依赖 root，也支持 DNS 方式签通配符
+acme.sh --issue -d example.com --standalone
+# 产物：~/.acme.sh/example.com/{fullchain.cer,example.com.key}
+
+# 3) 自签：**仅供本地/内网测试**，浏览器会报不受信任
+sudo mkdir -p /etc/ssl/example.com
+sudo openssl req -x509 -newkey rsa:2048 -nodes -days 90 \
+     -keyout /etc/ssl/example.com/privkey.pem \
+     -out    /etc/ssl/example.com/fullchain.pem -subj /CN=example.com
+```
+
+权限：私钥只让运行代理的那个用户读到 —— `chmod 600`，或 `chown root:www-data &&
+chmod 640`。证书链要用**全链**（`fullchain.pem` 含中间证书），只发叶子证书会让部分
+客户端报错。
+
+续期与重载：certbot 的续期由 systemd timer 触发，让代理重新加载证书交给 deploy hook：
+
+```bash
+# /etc/letsencrypt/renewal-hooks/deploy/reload-proxy.sh
+#!/bin/sh
+systemctl reload nginx          # Apache: systemctl reload apache2
+                                # HAProxy: systemctl reload haproxy
+                                # Caddy: 自己管理证书，通常无需动作
+```
+
+```bash
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-proxy.sh
+sudo certbot renew --dry-run        # 先演练一次
+```
+
+在代理里指向证书：nginx / Apache 直接写文件路径；HAProxy 要求证书与私钥**在同一个
+PEM 文件里**（`cat fullchain.pem privkey.pem > /etc/haproxy/certs/example.com.pem`）；
+Caddy 可以自己申请与续期，那时把配置里的 `tls` 行删掉即可。
+
+> **本服务不修改你的反向代理配置。** 下面的片段是给你复制粘贴的参考：写入、`nginx -t`
+> 校验与 reload 都由你（或你的配置管理工具）执行。`elenvind doctor` 只会告诉你这台
+> 机器上装了哪个反代、配置通常放在哪。
+
 ## nginx（最小可用）
 
 `/etc/nginx/conf.d/elenvind.conf`：
@@ -74,8 +124,8 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
     # HTTP/2：nginx >= 1.25.1 用 `http2 on;`；更早的版本（如 Ubuntu 24.04 自带的
-    # 1.24）不认识它，改用 `listen 443 ssl http2;` 并删掉这一行。
-    # `elenvind proxy configure` 会按本机版本自动选对写法。
+    # 1.24）不认识它，必须改用 `listen 443 ssl http2;` 并删掉这一行 —— 否则 nginx
+    # 会以 `unknown directive "http2"` 直接启动失败。
     http2 on;
     server_name example.com;
 

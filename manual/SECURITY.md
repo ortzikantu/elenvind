@@ -164,11 +164,6 @@ elenvind serve --bind 127.0.0.1:6871 --workers 1 --yes &
 curl -sD- -o/dev/null http://127.0.0.1:6871/ | grep -iE 'security-policy|strict-transport|x-frame|x-content'
 curl -s -o/dev/null -X POST -d 'a=b' http://127.0.0.1:6871/login            # 400（无 CSRF）
 curl -s -o/dev/null -X DELETE http://127.0.0.1:6871/                        # 405 + Allow
-
-# 域名检索与配置只增不覆盖
-elenvind proxy detect --domain <域名>
-elenvind proxy certs  --domain <域名>
-elenvind proxy configure --domain <域名>          # dry-run：只打印计划
 ```
 
 反代差异矩阵的复现：按 §4.1 的三列（直连 / nginx / 30 行标准库 TCP 转发器）各起一份，
