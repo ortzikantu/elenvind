@@ -72,6 +72,24 @@ class Workflows(unittest.TestCase):
         for version in declared:
             self.assertIn(f'"{version}"', ci_text, f"声明支持 {version}，但 CI 不测它")
 
+    def test_both_workflows_provision_the_same_nginx(self):
+        """CI 与发布流水线必须用同一个脚本装 nginx。
+
+        两边环境不一致正好是一次真实故障：`ci.yml` 装了新版 nginx，而发布流水线的
+        verify 任务没装 —— 它用 runner 自带的 1.24 跑同一套测试，于是 `http2 on;`
+        被报成未知指令，发布被挡在测试这一步。
+        """
+        for path in (CI, PUBLISH):
+            self.assertIn(".github/scripts/install-nginx.sh", _text(path), path.name)
+
+    def test_nginx_install_script_enforces_a_modern_version(self):
+        script = PROJECT_ROOT / ".github" / "scripts" / "install-nginx.sh"
+        self.assertTrue(script.is_file(), "缺少装 nginx 的脚本")
+        text = script.read_text(encoding="utf-8")
+        self.assertIn("nginx.org/keys", text)
+        self.assertIn("(1, 25, 1)", text, "必须断言版本：装不上就会静默退回旧 nginx")
+        self.assertIn("set -euo pipefail", text)
+
     def test_publish_is_tag_driven_and_checks_the_version(self):
         text = _text(PUBLISH)
         self.assertIn("tags:", text, "发布必须由 tag 触发")

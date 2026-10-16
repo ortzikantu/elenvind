@@ -383,6 +383,14 @@ class LogRotation(unittest.TestCase):
 
 
 class DeploymentFiles(unittest.TestCase):
+    #: `http2 on;` 只存在于 nginx >= 1.25.1；旧版本必须换成这两个 listen
+    LEGACY_HTTP2 = "    listen 443 ssl http2;\n    listen [::]:443 ssl http2;"
+    #: `:443` 的 listen + 中间任意注释行 + `http2 on;`
+    #: （注释文案改了也不会让替换失效，且断言必须恰好命中一处）
+    HTTP2_BLOCK = re.compile(
+        r"^    listen 443 ssl;\n    listen \[::\]:443 ssl;\n(?:    #.*\n)*?    http2 on;\n",
+        re.M)
+
     """部署文件的机械校验（能跑外部工具就跑，跑不了退化为静态断言）。"""
 
     def _nginx_directive(self, name: str) -> str:
@@ -489,13 +497,10 @@ class DeploymentFiles(unittest.TestCase):
         example = NGINX_EXAMPLE.read_text(encoding="utf-8")
         version = _nginx_version()
         if version and version < (1, 25, 1):
-            for modern in ("    listen 443 ssl;\n    listen [::]:443 ssl;\n    http2 on;",
-                           "    listen 443 ssl;\n    listen [::]:443 ssl;\n"
-                           "    # HTTP/2：nginx >= 1.25.1 用 `http2 on;`；更早的版本"
-                           "（如 Ubuntu 24.04 自带的\n    # 1.24）不认识它，改用 "
-                           "`listen 443 ssl http2;` 并删掉这一行。\n    http2 on;"):
-                example = example.replace(
-                    modern, "    listen 443 ssl http2;\n    listen [::]:443 ssl http2;")
+            example, replaced = self.HTTP2_BLOCK.subn(self.LEGACY_HTTP2 + "\n", example)
+            self.assertEqual(replaced, 1, "示例里应当恰好有一处 :443 的 HTTP/2 配置块")
+        else:
+            self.assertIn("http2 on;", example, "新式 nginx 的示例应当用 `http2 on;`")
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             certificate = workspace / "cert.pem"

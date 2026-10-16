@@ -49,6 +49,9 @@ jobs:
           print(f"版本一致：{version}")
           PY
 
+      - name: 安装 nginx（与 ci.yml 同一个脚本，保证环境一致）
+        run: bash .github/scripts/install-nginx.sh
+
       - name: 静态检查与全量测试
         run: |
           ruff check .
